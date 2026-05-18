@@ -9,6 +9,11 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Protocol, Union
 
+if platform.system() == "Windows":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
 K_CF_STRING_ENCODING_UTF8 = 0x08000100
 K_AX_VALUE_CGPOINT_TYPE = 1
 K_AX_VALUE_CGSIZE_TYPE = 2
@@ -367,6 +372,225 @@ def request_permissions_json(include_screen_recording: bool) -> str:
     return json.dumps(status, ensure_ascii=False)
 
 
+def windows_window_title(window: object) -> str:
+    return str(getattr(window, "title", "") or "").strip()
+
+
+def windows_window_is_usable(window: object) -> bool:
+    title = windows_window_title(window)
+    width = int(getattr(window, "width", 0) or 0)
+    height = int(getattr(window, "height", 0) or 0)
+    return bool(title and width > 0 and height > 0)
+
+
+def windows_window_hwnd(window: object) -> Optional[int]:
+    hwnd = getattr(window, "_hWnd", None) or getattr(window, "hWnd", None) or getattr(window, "hwnd", None)
+    try:
+        return int(hwnd) if hwnd else None
+    except (TypeError, ValueError):
+        return None
+
+
+def windows_title_is_kakao_main(title: str) -> bool:
+    return title.strip().casefold() in {"kakaotalk", "카카오톡"}
+
+
+def windows_all_windows() -> List[object]:
+    import pygetwindow
+
+    return [window for window in pygetwindow.getAllWindows() if windows_window_is_usable(window)]
+
+
+def windows_find_kakao_main_window() -> Optional[object]:
+    windows = windows_all_windows()
+    for window in windows:
+        if windows_title_is_kakao_main(windows_window_title(window)):
+            return window
+
+    for window in windows:
+        title = windows_window_title(window).casefold()
+        if "kakaotalk" in title or "카카오톡" in title:
+            return window
+
+    return None
+
+
+def windows_active_hwnd() -> Optional[int]:
+    if platform.system() != "Windows":
+        return None
+
+    try:
+        from ctypes import wintypes
+
+        ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        return int(hwnd) if hwnd else None
+    except Exception:
+        return None
+
+
+def windows_window_is_foreground(window: object) -> bool:
+    target_hwnd = windows_window_hwnd(window)
+    active_hwnd = windows_active_hwnd()
+    if target_hwnd and active_hwnd:
+        return target_hwnd == active_hwnd
+
+    target_title = windows_window_title(window)
+    active_title = windows_front_window_title()
+    return bool(target_title and active_title and target_title == active_title)
+
+
+def windows_force_foreground(window: object) -> bool:
+    hwnd = windows_window_hwnd(window)
+    if platform.system() != "Windows" or not hwnd:
+        return False
+
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd_value = wintypes.HWND(hwnd)
+        sw_restore = 9
+        sw_show = 5
+        hwnd_topmost = wintypes.HWND(-1)
+        hwnd_notopmost = wintypes.HWND(-2)
+        swp_nosize = 0x0001
+        swp_nomove = 0x0002
+        swp_showwindow = 0x0040
+        flags = swp_nosize | swp_nomove | swp_showwindow
+
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        user32.AttachThreadInput.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetActiveWindow.argtypes = [wintypes.HWND]
+        user32.SetActiveWindow.restype = wintypes.HWND
+        user32.SetFocus.argtypes = [wintypes.HWND]
+        user32.SetFocus.restype = wintypes.HWND
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        user32.ShowWindow(hwnd_value, sw_restore if user32.IsIconic(hwnd_value) else sw_show)
+        user32.SetWindowPos(hwnd_value, hwnd_topmost, 0, 0, 0, 0, flags)
+        user32.SetWindowPos(hwnd_value, hwnd_notopmost, 0, 0, 0, 0, flags)
+        user32.BringWindowToTop(hwnd_value)
+
+        current_thread = kernel32.GetCurrentThreadId()
+        target_thread = user32.GetWindowThreadProcessId(hwnd_value, None)
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+        attached_threads: List[int] = []
+
+        for thread_id in (target_thread, foreground_thread):
+            if thread_id and thread_id != current_thread and thread_id not in attached_threads:
+                if user32.AttachThreadInput(current_thread, thread_id, True):
+                    attached_threads.append(thread_id)
+
+        try:
+            user32.SetForegroundWindow(hwnd_value)
+            user32.SetActiveWindow(hwnd_value)
+            user32.SetFocus(hwnd_value)
+        finally:
+            for thread_id in attached_threads:
+                user32.AttachThreadInput(current_thread, thread_id, False)
+
+        time.sleep(0.25)
+        return windows_window_is_foreground(window)
+    except Exception:
+        return False
+
+
+def windows_activate_window(window: object) -> bool:
+    try:
+        if bool(getattr(window, "isMinimized", False)):
+            getattr(window, "restore")()
+            time.sleep(0.2)
+        if windows_force_foreground(window):
+            return True
+        getattr(window, "activate")()
+        time.sleep(0.25)
+        return windows_window_is_foreground(window)
+    except Exception:
+        return windows_force_foreground(window)
+
+
+def windows_front_window_title() -> str:
+    try:
+        import pygetwindow
+
+        window = pygetwindow.getActiveWindow()
+        return windows_window_title(window) if window else ""
+    except Exception:
+        return ""
+
+
+def windows_ensure_kakao_main_foreground(steps: List[str]) -> None:
+    title = windows_front_window_title()
+    steps.append(f"windows_foreground_title:{title}")
+    if windows_title_is_kakao_main(title):
+        steps.append("verified_kakaotalk_foreground_windows")
+        return
+
+    raise RuntimeError(
+        "카카오톡 메인 창을 앞으로 가져오지 못했습니다. "
+        f"현재 활성 창은 '{title or '알 수 없음'}'입니다. AutoSend가 아니라 카카오톡 창에 포커스가 있어야 합니다."
+    )
+
+
+def windows_window_bounds(window: object) -> Optional[tuple[int, int, int, int]]:
+    try:
+        left = int(getattr(window, "left", 0) or 0)
+        top = int(getattr(window, "top", 0) or 0)
+        width = int(getattr(window, "width", 0) or 0)
+        height = int(getattr(window, "height", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if width <= 0 or height <= 0:
+        return None
+    return left, top, width, height
+
+
+def windows_select_chat_tab(tools: DesktopTools, steps: List[str]) -> None:
+    window = windows_find_kakao_main_window()
+    if not window:
+        raise RuntimeError("카카오톡 메인 창을 찾지 못했습니다. PC 카카오톡을 실행한 뒤 다시 시도하세요.")
+
+    if not windows_activate_window(window):
+        raise RuntimeError("카카오톡 메인 창을 앞으로 가져오지 못했습니다.")
+
+    bounds = windows_window_bounds(window)
+    if not bounds:
+        steps.append("selected_chat_tab_windows_skipped_no_bounds")
+        return
+
+    left, top, width, height = bounds
+    tab_x = left + min(42, max(28, width // 10))
+    tab_y = top + min(120, max(82, height // 6))
+    tools.click(tab_x, tab_y)
+    steps.append(f"selected_chat_tab_windows:{tab_x},{tab_y}")
+    tools.sleep(0.2)
+
+
 def activate_kakaotalk(steps: List[str]) -> None:
     system = platform.system()
     if system == "Darwin":
@@ -391,15 +615,18 @@ def activate_kakaotalk(steps: List[str]) -> None:
 
     if system == "Windows":
         try:
-            import pygetwindow
-
-            windows = pygetwindow.getWindowsWithTitle("KakaoTalk") or pygetwindow.getWindowsWithTitle("카카오톡")
-            if windows:
-                windows[0].activate()
+            window = windows_find_kakao_main_window()
+            if window and windows_activate_window(window):
                 steps.append("activated_kakaotalk_windows")
                 return
+            active_title = windows_front_window_title()
+            raise RuntimeError(
+                "카카오톡 메인 창을 활성화하지 못했습니다. "
+                f"현재 활성 창은 '{active_title or '알 수 없음'}'입니다."
+            )
         except Exception as exc:
             steps.append(f"windows_activation_skipped:{exc}")
+            raise
 
     steps.append("activation_not_supported_or_not_found")
 
@@ -841,6 +1068,24 @@ def room_title_matches(room: str, title: str) -> bool:
     return bool(normalized_room and normalized_room in normalized_title)
 
 
+def windows_activate_room_if_open(room: str, steps: List[str]) -> bool:
+    if platform.system() != "Windows":
+        return False
+
+    try:
+        for window in windows_all_windows():
+            title = windows_window_title(window)
+            if windows_title_is_kakao_main(title):
+                continue
+            if room_title_matches(room, title) and windows_activate_window(window):
+                steps.append(f"activated_existing_room_windows:{title}")
+                return True
+    except Exception as exc:
+        steps.append(f"windows_existing_room_lookup_skipped:{exc}")
+
+    return False
+
+
 def focus_macos_message_input(tools: DesktopTools, steps: List[str]) -> bool:
     bounds = macos_front_window_bounds()
     if not bounds:
@@ -873,12 +1118,19 @@ def macos_paste_message_and_maybe_send(message: str, dry_run: bool, tools: Deskt
 
 def open_kakao_room(room: str, tools: DesktopTools, steps: List[str], search_delay: float) -> None:
     system = platform.system()
+    if system == "Windows" and windows_activate_room_if_open(room, steps):
+        steps.append("room_already_open")
+        return
+
     activate_kakaotalk(steps)
     tools.sleep(0.5)
 
     if system == "Darwin" and room_title_matches(room, macos_front_window_title()):
         steps.append("room_already_open")
         return
+
+    if system == "Windows":
+        windows_ensure_kakao_main_foreground(steps)
 
     modifier = "command" if system == "Darwin" else "ctrl"
 
@@ -889,6 +1141,10 @@ def open_kakao_room(room: str, tools: DesktopTools, steps: List[str], search_del
         steps.append("selected_chat_tab_macos")
         tools.sleep(0.3)
 
+    if system == "Windows":
+        windows_select_chat_tab(tools, steps)
+        windows_ensure_kakao_main_foreground(steps)
+
     if system == "Darwin":
         macos_press_command_key(tools, "f")
     else:
@@ -897,6 +1153,9 @@ def open_kakao_room(room: str, tools: DesktopTools, steps: List[str], search_del
     tools.sleep(0.2)
     if system == "Darwin":
         macos_press_command_key(tools, "a")
+    elif system == "Windows":
+        tools.press("backspace")
+        steps.append("cleared_search_without_ctrl_a_windows")
     else:
         tools.hotkey(modifier, "a")
     tools.sleep(0.1)
@@ -916,6 +1175,17 @@ def open_kakao_room(room: str, tools: DesktopTools, steps: List[str], search_del
             tools.sleep(0.15)
         tools.sleep(0.8)
         steps.append(f"open_room_attempt:{label}")
+        if system == "Windows":
+            title = windows_front_window_title()
+            steps.append(f"front_window_title:{title}")
+            if room_title_matches(room, title):
+                steps.append("opened_room_verified")
+                return
+            if windows_activate_room_if_open(room, steps):
+                steps.append("opened_room_verified")
+                return
+            continue
+
         if system != "Darwin":
             return
 

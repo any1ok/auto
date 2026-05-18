@@ -1,7 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / "autosend_automation.py"
@@ -121,6 +121,51 @@ class DryRunTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("채팅방을 열지 못했습니다", result.error)
+
+    @patch.object(automation, "activate_kakaotalk", lambda steps: steps.append("activated"))
+    @patch.object(automation, "windows_activate_room_if_open", lambda room, steps: False)
+    @patch.object(automation, "windows_select_chat_tab", lambda tools, steps: steps.append("selected_chat_tab_windows"))
+    @patch.object(automation.platform, "system", lambda: "Windows")
+    def test_windows_room_search_does_not_use_ctrl_a_friend_add_shortcut(self):
+        tools = FakeTools()
+        front_title = Mock(side_effect=["KakaoTalk", "KakaoTalk", "테스트방"])
+
+        with patch.object(automation, "windows_front_window_title", front_title):
+            automation.open_kakao_room("테스트방", tools, [], search_delay=0)
+
+        self.assertIn(("hotkey", ("ctrl", "f")), tools.calls)
+        self.assertIn(("press", "backspace"), tools.calls)
+        self.assertNotIn(("hotkey", ("ctrl", "a")), tools.calls)
+
+    @patch.object(automation, "activate_kakaotalk", lambda steps: steps.append("activated"))
+    @patch.object(automation, "windows_activate_room_if_open", lambda room, steps: False)
+    @patch.object(automation, "windows_front_window_title", lambda: "AutoSend")
+    @patch.object(automation.platform, "system", lambda: "Windows")
+    def test_windows_send_fails_before_search_when_kakao_is_not_foreground(self):
+        tools = FakeTools()
+
+        result = automation.run_kakao_send("테스트방", "안녕하세요", False, tools, search_delay=0)
+
+        self.assertFalse(result.ok)
+        self.assertIn("카카오톡 메인 창을 앞으로 가져오지 못했습니다", result.error)
+        self.assertNotIn(("hotkey", ("ctrl", "f")), tools.calls)
+        self.assertNotIn("pasted_message", result.steps)
+        self.assertNotIn(("paste", "안녕하세요"), tools.calls)
+
+    @patch.object(automation, "activate_kakaotalk", lambda steps: steps.append("activated"))
+    @patch.object(automation, "windows_activate_room_if_open", lambda room, steps: False)
+    @patch.object(automation, "windows_select_chat_tab", lambda tools, steps: steps.append("selected_chat_tab_windows"))
+    @patch.object(automation.platform, "system", lambda: "Windows")
+    def test_windows_send_fails_before_pasting_message_when_room_not_verified(self):
+        tools = FakeTools()
+        front_title = Mock(side_effect=["KakaoTalk", "KakaoTalk", "친구 추가", "친구 추가", "친구 추가"])
+
+        with patch.object(automation, "windows_front_window_title", front_title):
+            result = automation.run_kakao_send("테스트방", "안녕하세요", False, tools, search_delay=0)
+
+        self.assertFalse(result.ok)
+        self.assertNotIn("pasted_message", result.steps)
+        self.assertNotIn(("paste", "안녕하세요"), tools.calls)
 
     def test_rejects_empty_message(self):
         result = automation.run_kakao_send("테스트방", " ", True, FakeTools(), search_delay=0)
