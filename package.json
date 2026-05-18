@@ -1,0 +1,23 @@
+{
+  "name": "autosend",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev -w @autosend/web",
+    "dev:desktop": "npm run dev -w @autosend/desktop",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present && npm run test:automation",
+    "test:automation": "python3 -m unittest discover -s apps/automation/tests",
+    "setup:automation": "node scripts/setup-automation.mjs",
+    "prisma:generate": "npm run prisma:generate -w @autosend/web",
+    "prisma:studio": "npm run prisma:studio -w @autosend/web"
+  },
+  "devDependencies": {
+    "typescript": "latest"
+  }
+}

@@ -1,0 +1,124 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DeviceStatus {
+  PAIRING
+  ONLINE
+  OFFLINE
+  REVOKED
+}
+
+enum JobStatus {
+  DRAFT
+  QUEUED
+  LOCKED
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum SendLogStatus {
+  SENT
+  FAILED
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  name         String?
+  passwordHash String
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  devices      Device[]
+  jobs         MessageJob[]
+  recipients   Recipient[]
+  sendLogs     SendLog[]
+}
+
+model Device {
+  id               String       @id @default(cuid())
+  userId           String
+  name             String
+  platform         String?
+  status           DeviceStatus @default(PAIRING)
+  pairingCodeHash  String?      @unique
+  pairingExpiresAt DateTime?
+  agentTokenHash   String?      @unique
+  tokenLastFour    String?
+  lastSeenAt       DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  jobs             MessageJob[]
+  sendLogs         SendLog[]
+
+  @@index([userId, status])
+}
+
+model Recipient {
+  id            String       @id @default(cuid())
+  userId        String
+  name          String
+  phone         String?
+  kakaoRoomName String
+  consent       Boolean      @default(true)
+  memo          String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  jobs          MessageJob[]
+
+  @@unique([userId, kakaoRoomName])
+  @@index([userId, kakaoRoomName])
+}
+
+model MessageJob {
+  id               String     @id @default(cuid())
+  userId           String
+  recipientId      String?
+  deviceId         String?
+  recipientName    String
+  phone            String?
+  kakaoRoomName    String
+  message          String
+  scheduledAt      DateTime   @default(now())
+  status           JobStatus  @default(QUEUED)
+  failureReason    String?
+  attempts         Int        @default(0)
+  lockedAt         DateTime?
+  lockedByDeviceId String?
+  sentAt           DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+  device           Device?    @relation(fields: [deviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  recipient        Recipient? @relation(fields: [recipientId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  user             User       @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  sendLogs         SendLog[]
+
+  @@index([deviceId, status])
+  @@index([userId, status, scheduledAt])
+}
+
+model SendLog {
+  id             String        @id @default(cuid())
+  userId         String
+  jobId          String
+  deviceId       String?
+  status         SendLogStatus
+  message        String?
+  screenshotPath String?
+  createdAt      DateTime      @default(now())
+  device         Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  job            MessageJob    @relation(fields: [jobId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([jobId, createdAt])
+  @@index([userId, createdAt])
+}
+
