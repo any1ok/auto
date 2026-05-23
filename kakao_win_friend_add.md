@@ -1,15 +1,15 @@
 # 카카오톡 친구 추가 자동화 준비 (Windows)
 
 `kakao_win_friend_add.py` 는 친구 추가 플로우를 별도 파일로 분리하기 위한
-Windows 전용 진입점입니다. 현재는 친구 추가 창을 실제로 여는 단계 전에,
-기존 `kakao_win.py` 의 검증된 방법으로 아래 두 단계만 수행합니다.
+Windows 전용 진입점입니다. 현재는 기존 `kakao_win.py` 의 검증된 창 제어
+로직을 재사용해 친구 추가 팝오버를 여는 단계까지 수행합니다.
 
 ## 스텝
 
 - [x] Step 1 — 이미 실행 중인 카카오톡 메인 창을 foreground 로 보장
 - [x] Step 2 — 친구 탭으로 이동
-- [ ] Step 3 — 친구 추가 창 열기 (`Ctrl + A` 후보)
-- [ ] Step 4 — 연락처/ID 입력 방식 결정 및 구현
+- [x] Step 3 — 친구 추가 창 열기 (`Ctrl + A`, 이미 열림 감지)
+
 
 ## 사용법
 
@@ -22,6 +22,14 @@ python kakao_win_friend_add.py
 ```text
 [Step 1] 카카오톡을 포커스했습니다.
 [Step 2] 친구 탭으로 포커스했습니다. (이미 활성 탭, Ctrl+Tab × 0)
+[Step 3] 친구 추가 창을 열었습니다. (Ctrl+A, hwnd=0x...)
+```
+
+친구 추가 창이 이미 열려 있으면 메인 창이 disabled 상태라 Step 1/2 를
+다시 수행하지 않고 열린 창을 그대로 사용합니다.
+
+```text
+[Step 3] 친구 추가 창이 이미 열려 있습니다. (hwnd=0x..., Step 1/2 생략)
 ```
 
 이미 다른 탭이 활성 상태라면 `Ctrl+Tab` 을 필요한 횟수만큼 보내 친구 탭에
@@ -53,12 +61,11 @@ python kakao_win_friend_add.py
 - Step 2 는 카카오톡 메인 창 내부의 `EVA_ChildWindow` 아래 `EVA_Window`
   패널 중 visible 인 패널을 현재 탭으로 판단합니다. 목표인 친구 탭(idx 0)에
   도달할 때까지 `SendInput` 으로 `Ctrl+Tab` 을 보냅니다.
+- Step 3 은 실행 전 이미 열린 친구 추가 창을 먼저 찾습니다. 친구 추가 창은
+  visible top-level `EVA_Window_Dblclk` 이고, 빈 title, 적정 팝오버 크기,
+  visible 표준 `Edit` 입력칸 2개 이상이라는 구조로 식별합니다.
+- 친구 추가 창이 없으면 친구 탭 foreground 를 재확인한 뒤 `SendInput` 으로
+  `Ctrl+A` 를 보내고, 새로 뜬 팝오버를 위 구조로 폴링 검증합니다.
 - 카카오톡이 관리자 권한으로 실행 중이면 스크립트도 같은 권한으로 실행해야
   합니다. 권한 레벨이 다르면 Windows UIPI 때문에 foreground 전환이나 입력이
   차단될 수 있습니다.
-
-## 다음 구현 후보
-
-다음 단계는 Step 2 직후 `Ctrl + A` 를 `SendInput` 으로 보내 친구 추가 창이
-뜨는지 검증하는 방식이 가장 단순합니다. 단, 창 타이틀/클래스명 검증이 먼저
-붙어야 이후 연락처 또는 카카오톡 ID 입력 단계가 안정적으로 이어집니다.
