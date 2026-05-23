@@ -29,6 +29,7 @@ from kakao_mac import (
 
 
 FRIEND_ADD_RESULT_SUCCESS = "SUCCESS_CLOSED"
+FRIEND_ADD_RESULT_SUCCESS_MESSAGE = "SUCCESS_MESSAGE"
 FRIEND_ADD_RESULT_ERROR = "ERROR"
 
 
@@ -235,8 +236,9 @@ end tell"""
 def step5_confirm_friend_add() -> bool:
     """친구 추가를 확정하고 결과를 판정한다.
 
-    성공은 친구추가 팝오버가 닫히는 것으로 판정한다. 실패는 팝오버가 유지된 채
-    `할 수 없습니다` 같은 오류 문구가 노출되는지로 판정한다.
+    성공은 친구추가 팝오버가 닫히거나 `친구 등록이 완료되었습니다.` 문구가
+    노출되는 것으로 판정한다. 실패는 팝오버가 유지된 채 `할 수 없습니다` 같은
+    오류 문구가 노출되는지로 판정하고, 판정 후 팝오버를 ESC 로 닫는다.
     """
     _activate_kakao()
     script = """\
@@ -296,9 +298,22 @@ on _hasErrorText(messagesText)
   if messagesText contains "오류" then return true
   if messagesText contains "실패" then return true
   if messagesText contains "없는 번호" then return true
-  if messagesText contains "이미 등록" then return true
   return false
 end _hasErrorText
+
+on _hasSuccessText(messagesText)
+  if messagesText contains "친구 등록이 완료되었습니다" then return true
+  if messagesText contains "등록이 완료" then return true
+  if messagesText contains "추가되었습니다" then return true
+  if messagesText contains "이미 등록된 친구" then return true
+  if messagesText contains "이미 등록" then return true
+  return false
+end _hasSuccessText
+
+on _closeFriendAddPopover()
+  tell application "System Events" to tell process "KakaoTalk" to key code 53
+  delay 0.1
+end _closeFriendAddPopover
 
 tell application "System Events"
   tell process "KakaoTalk"
@@ -310,10 +325,14 @@ tell application "System Events"
       set submitButton to button "친구 추가" of targetPopover
     end try
     if submitButton is missing value then
-      return "SUBMIT_NOT_FOUND" & linefeed & (my _collectTexts(targetPopover))
+      set messagesText to my _collectTexts(targetPopover)
+      my _closeFriendAddPopover()
+      return "SUBMIT_NOT_FOUND" & linefeed & messagesText
     end if
     if not (enabled of submitButton) then
-      return "BUTTON_DISABLED" & linefeed & (my _collectTexts(targetPopover))
+      set messagesText to my _collectTexts(targetPopover)
+      my _closeFriendAddPopover()
+      return "BUTTON_DISABLED" & linefeed & messagesText
     end if
 
     perform action "AXPress" of submitButton
@@ -328,7 +347,12 @@ repeat 30 times
   end if
 
   set messagesText to my _collectTexts(targetPopover)
+  if my _hasSuccessText(messagesText) then
+    my _closeFriendAddPopover()
+    return "SUCCESS_MESSAGE" & linefeed & messagesText
+  end if
   if my _hasErrorText(messagesText) then
+    my _closeFriendAddPopover()
     return "ERROR" & linefeed & messagesText
   end if
 end repeat
@@ -337,7 +361,13 @@ set targetPopover to my _findFriendAddPopover()
 if targetPopover is missing value then
   return "SUCCESS_CLOSED" & linefeed & ""
 end if
-return "STILL_OPEN" & linefeed & (my _collectTexts(targetPopover))
+set messagesText to my _collectTexts(targetPopover)
+if my _hasSuccessText(messagesText) then
+  my _closeFriendAddPopover()
+  return "SUCCESS_MESSAGE" & linefeed & messagesText
+end if
+my _closeFriendAddPopover()
+return "STILL_OPEN" & linefeed & messagesText
 """
 
     result = _run_osascript(script)
@@ -345,10 +375,17 @@ return "STILL_OPEN" & linefeed & (my _collectTexts(targetPopover))
     if status == FRIEND_ADD_RESULT_SUCCESS:
         print("[Step 5] 친구 추가 완료: 팝오버가 닫혔습니다.")
         return True
+    if status == FRIEND_ADD_RESULT_SUCCESS_MESSAGE:
+        readable_messages = messages.strip() or "(성공 문구 없음)"
+        print(f"[Step 5] 친구 추가 완료: {readable_messages} (팝오버 닫음)")
+        return True
 
     readable_messages = messages.strip() or "(오류 문구 없음)"
     if status == FRIEND_ADD_RESULT_ERROR:
-        print(f"[Step 5] 친구 추가 실패: {readable_messages}", file=sys.stderr)
+        print(
+            f"[Step 5] 친구 추가 실패: {readable_messages} (팝오버 닫음)",
+            file=sys.stderr,
+        )
         return False
 
     raise KakaoMacError(
