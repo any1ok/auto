@@ -29,7 +29,115 @@ from kakao_mac import (
 
 
 FRIEND_ADD_RESULT_SUCCESS = "SUCCESS_CLOSED"
+FRIEND_ADD_RESULT_SUCCESS_MESSAGE = "SUCCESS_MESSAGE"
 FRIEND_ADD_RESULT_ERROR = "ERROR"
+
+FRIEND_ADD_APPLESCRIPT_HELPERS = """\
+on _textOf(v)
+  try
+    if v is missing value then return ""
+    return v as text
+  on error
+    return ""
+  end try
+end _textOf
+
+on _findFriendAddPopover()
+  tell application "System Events"
+    tell process "KakaoTalk"
+      repeat with elem in UI elements of window 1
+        try
+          if ((class of elem) as text) is "button" then
+            repeat with child in UI elements of elem
+              try
+                if ((class of child) as text) is "pop over" then return child
+              end try
+            end repeat
+          end if
+        end try
+      end repeat
+    end tell
+  end tell
+  return missing value
+end _findFriendAddPopover
+
+on _isFriendAddPopover(targetPopover)
+  if targetPopover is missing value then return false
+
+  set hasTitle to false
+  set hasContactTab to false
+  set hasIdTab to false
+  set hasSubmitButton to false
+
+  tell application "System Events"
+    try
+      repeat with popChild in UI elements of targetPopover
+        set labelText to (my _textOf(name of popChild)) & "\n" & (my _textOf(value of popChild))
+        if labelText contains "친구 추가" then
+          set hasTitle to true
+          try
+            if ((class of popChild) as text) is "button" then set hasSubmitButton to true
+          end try
+        end if
+        if labelText contains "연락처" then set hasContactTab to true
+        if labelText contains "ID" then set hasIdTab to true
+      end repeat
+    end try
+  end tell
+
+  return hasTitle and hasContactTab and hasIdTab and hasSubmitButton
+end _isFriendAddPopover
+
+on _hasFriendAddPopover()
+  return my _isFriendAddPopover(my _findFriendAddPopover())
+end _hasFriendAddPopover
+
+on _collectTexts(targetPopover)
+  set messages to {}
+  tell application "System Events"
+    try
+      repeat with popChild in UI elements of targetPopover
+        try
+          set cls to (class of popChild) as text
+          if cls is "static text" or cls is "button" or cls is "text field" then
+            set nm to my _textOf(name of popChild)
+            set valText to my _textOf(value of popChild)
+            if nm is not "" then copy nm to end of messages
+            if valText is not "" and valText is not nm then copy valText to end of messages
+          end if
+        end try
+      end repeat
+    end try
+  end tell
+  set AppleScript's text item delimiters to " | "
+  set messagesText to messages as text
+  set AppleScript's text item delimiters to ""
+  return messagesText
+end _collectTexts
+
+on _hasErrorText(messagesText)
+  if messagesText contains "할 수 없습니다" then return true
+  if messagesText contains "오류" then return true
+  if messagesText contains "실패" then return true
+  if messagesText contains "없는 번호" then return true
+  return false
+end _hasErrorText
+
+on _hasSuccessText(messagesText)
+  if messagesText contains "친구 등록이 완료되었습니다" then return true
+  if messagesText contains "등록이 완료" then return true
+  if messagesText contains "추가되었습니다" then return true
+  if messagesText contains "이미 등록된 친구" then return true
+  if messagesText contains "이미 등록" then return true
+  return false
+end _hasSuccessText
+
+on _closeFriendAddPopover()
+  tell application "System Events" to tell process "KakaoTalk" to key code 53
+  delay 0.1
+end _closeFriendAddPopover
+
+"""
 
 
 def step2_focus_friends_tab() -> None:
@@ -45,48 +153,7 @@ def step3_open_friend_add_popover() -> None:
     AXPress 한다. 마우스 좌표 이동/클릭은 사용하지 않는다.
     """
     _activate_kakao()
-    script = """\
-on _textOf(v)
-  try
-    if v is missing value then return ""
-    return v as text
-  on error
-    return ""
-  end try
-end _textOf
-
-on _hasFriendAddPopover(targetButton)
-  tell application "System Events"
-    try
-      repeat with child in UI elements of targetButton
-        try
-          if ((class of child) as text) is "pop over" then
-            set hasTitle to false
-            set hasContactTab to false
-            set hasIdTab to false
-            set hasSubmitButton to false
-
-            repeat with popChild in UI elements of child
-              set labelText to (my _textOf(name of popChild)) & "\n" & (my _textOf(value of popChild))
-              if labelText contains "친구 추가" then
-                set hasTitle to true
-                try
-                  if ((class of popChild) as text) is "button" then set hasSubmitButton to true
-                end try
-              end if
-              if labelText contains "연락처" then set hasContactTab to true
-              if labelText contains "ID" then set hasIdTab to true
-            end repeat
-
-            if hasTitle and hasContactTab and hasIdTab and hasSubmitButton then return true
-          end if
-        end try
-      end repeat
-    end try
-  end tell
-  return false
-end _hasFriendAddPopover
-
+    script = FRIEND_ADD_APPLESCRIPT_HELPERS + """\
 tell application "System Events"
   tell process "KakaoTalk"
     set targetButton to missing value
@@ -117,7 +184,7 @@ tell application "System Events"
       return "BUTTON_NOT_FOUND"
     end if
 
-    if my _hasFriendAddPopover(targetButton) then
+    if my _hasFriendAddPopover() then
       return "ALREADY_OPEN"
     end if
 
@@ -125,7 +192,7 @@ tell application "System Events"
 
     repeat 10 times
       delay 0.1
-      if my _hasFriendAddPopover(targetButton) then
+      if my _hasFriendAddPopover() then
         return "OPENED"
       end if
     end repeat
@@ -145,14 +212,14 @@ end tell"""
     print(f"[Step 3] 친구추가 팝오버를 열었습니다. ({suffix})")
 
 
-def step4_fill_contact_fields(name: str, phone: str) -> bool:
+def step4_fill_contact_fields(name: str, phone: str) -> None:
     """연락처 탭의 이름/전화번호 필드를 채운다.
 
     `set value` 는 값만 바꾸고 카카오톡 내부 validation 이벤트를 발생시키지 않아
     버튼이 비활성으로 남는다. 그래서 각 필드에 AX focus 를 준 뒤 클립보드 붙여넣기로
     입력한다.
 
-    반환값은 `친구 추가` 버튼 활성 여부다.
+    `친구 추가` 버튼 활성 여부는 로그로 남기고, 실제 확정/실패 판정은 Step 5 가 맡는다.
     """
     if not name.strip():
         raise KakaoMacError("step4: 이름이 비어 있습니다.")
@@ -162,25 +229,10 @@ def step4_fill_contact_fields(name: str, phone: str) -> bool:
     name_escaped = _applescript_escape(name)
     phone_escaped = _applescript_escape(phone)
     _activate_kakao()
-    script = f"""\
+    script = FRIEND_ADD_APPLESCRIPT_HELPERS + f"""\
 tell application "System Events"
   tell process "KakaoTalk"
-    set targetPopover to missing value
-    repeat with elem in UI elements of window 1
-      try
-        if ((class of elem) as text) is "button" then
-          repeat with child in UI elements of elem
-            try
-              if ((class of child) as text) is "pop over" then
-                set targetPopover to child
-                exit repeat
-              end if
-            end try
-          end repeat
-        end if
-      end try
-      if targetPopover is not missing value then exit repeat
-    end repeat
+    set targetPopover to my _findFriendAddPopover()
 
     if targetPopover is missing value then
       return "POPOVER_NOT_FOUND"
@@ -229,77 +281,17 @@ end tell"""
         f"[Step 4] 이름/전화번호 입력 완료: name={actual_name!r}, "
         f"phone={actual_phone!r}, 친구 추가 버튼={state}"
     )
-    return submit_enabled
 
 
 def step5_confirm_friend_add() -> bool:
     """친구 추가를 확정하고 결과를 판정한다.
 
-    성공은 친구추가 팝오버가 닫히는 것으로 판정한다. 실패는 팝오버가 유지된 채
-    `할 수 없습니다` 같은 오류 문구가 노출되는지로 판정한다.
+    성공은 친구추가 팝오버가 닫히거나 `친구 등록이 완료되었습니다.` 문구가
+    노출되는 것으로 판정한다. 실패는 팝오버가 유지된 채 `할 수 없습니다` 같은
+    오류 문구가 노출되는지로 판정하고, 판정 후 팝오버를 ESC 로 닫는다.
     """
     _activate_kakao()
-    script = """\
-on _textOf(v)
-  try
-    if v is missing value then return ""
-    return v as text
-  on error
-    return ""
-  end try
-end _textOf
-
-on _findFriendAddPopover()
-  tell application "System Events"
-    tell process "KakaoTalk"
-      repeat with elem in UI elements of window 1
-        try
-          if ((class of elem) as text) is "button" then
-            repeat with child in UI elements of elem
-              try
-                if ((class of child) as text) is "pop over" then return child
-              end try
-            end repeat
-          end if
-        end try
-      end repeat
-    end tell
-  end tell
-  return missing value
-end _findFriendAddPopover
-
-on _collectTexts(targetPopover)
-  set messages to {}
-  tell application "System Events"
-    try
-      repeat with popChild in UI elements of targetPopover
-        try
-          set cls to (class of popChild) as text
-          if cls is "static text" or cls is "button" or cls is "text field" then
-            set nm to my _textOf(name of popChild)
-            set valText to my _textOf(value of popChild)
-            if nm is not "" then copy nm to end of messages
-            if valText is not "" and valText is not nm then copy valText to end of messages
-          end if
-        end try
-      end repeat
-    end try
-  end tell
-  set AppleScript's text item delimiters to " | "
-  set messagesText to messages as text
-  set AppleScript's text item delimiters to ""
-  return messagesText
-end _collectTexts
-
-on _hasErrorText(messagesText)
-  if messagesText contains "할 수 없습니다" then return true
-  if messagesText contains "오류" then return true
-  if messagesText contains "실패" then return true
-  if messagesText contains "없는 번호" then return true
-  if messagesText contains "이미 등록" then return true
-  return false
-end _hasErrorText
-
+    script = FRIEND_ADD_APPLESCRIPT_HELPERS + """\
 tell application "System Events"
   tell process "KakaoTalk"
     set targetPopover to my _findFriendAddPopover()
@@ -310,10 +302,14 @@ tell application "System Events"
       set submitButton to button "친구 추가" of targetPopover
     end try
     if submitButton is missing value then
-      return "SUBMIT_NOT_FOUND" & linefeed & (my _collectTexts(targetPopover))
+      set messagesText to my _collectTexts(targetPopover)
+      my _closeFriendAddPopover()
+      return "SUBMIT_NOT_FOUND" & linefeed & messagesText
     end if
     if not (enabled of submitButton) then
-      return "BUTTON_DISABLED" & linefeed & (my _collectTexts(targetPopover))
+      set messagesText to my _collectTexts(targetPopover)
+      my _closeFriendAddPopover()
+      return "BUTTON_DISABLED" & linefeed & messagesText
     end if
 
     perform action "AXPress" of submitButton
@@ -328,7 +324,12 @@ repeat 30 times
   end if
 
   set messagesText to my _collectTexts(targetPopover)
+  if my _hasSuccessText(messagesText) then
+    my _closeFriendAddPopover()
+    return "SUCCESS_MESSAGE" & linefeed & messagesText
+  end if
   if my _hasErrorText(messagesText) then
+    my _closeFriendAddPopover()
     return "ERROR" & linefeed & messagesText
   end if
 end repeat
@@ -337,7 +338,13 @@ set targetPopover to my _findFriendAddPopover()
 if targetPopover is missing value then
   return "SUCCESS_CLOSED" & linefeed & ""
 end if
-return "STILL_OPEN" & linefeed & (my _collectTexts(targetPopover))
+set messagesText to my _collectTexts(targetPopover)
+if my _hasSuccessText(messagesText) then
+  my _closeFriendAddPopover()
+  return "SUCCESS_MESSAGE" & linefeed & messagesText
+end if
+my _closeFriendAddPopover()
+return "STILL_OPEN" & linefeed & messagesText
 """
 
     result = _run_osascript(script)
@@ -345,10 +352,17 @@ return "STILL_OPEN" & linefeed & (my _collectTexts(targetPopover))
     if status == FRIEND_ADD_RESULT_SUCCESS:
         print("[Step 5] 친구 추가 완료: 팝오버가 닫혔습니다.")
         return True
+    if status == FRIEND_ADD_RESULT_SUCCESS_MESSAGE:
+        readable_messages = messages.strip() or "(성공 문구 없음)"
+        print(f"[Step 5] 친구 추가 완료: {readable_messages} (팝오버 닫음)")
+        return True
 
     readable_messages = messages.strip() or "(오류 문구 없음)"
     if status == FRIEND_ADD_RESULT_ERROR:
-        print(f"[Step 5] 친구 추가 실패: {readable_messages}", file=sys.stderr)
+        print(
+            f"[Step 5] 친구 추가 실패: {readable_messages} (팝오버 닫음)",
+            file=sys.stderr,
+        )
         return False
 
     raise KakaoMacError(
