@@ -35,7 +35,7 @@ from typing import Any, Optional
 
 MESSAGES_URL = "https://messages.google.com/web/conversations"
 DEFAULT_DEBUG_PORT = 9222
-DEFAULT_PROFILE_DIR = Path.home() / ".google_message_chrome_profile"
+DEFAULT_PROFILE_DIR = Path(__file__).resolve().parent / ".google_messages_chrome_profile"
 DEFAULT_LOGIN_TIMEOUT_S = 180
 DEFAULT_ACTION_TIMEOUT_MS = 15_000
 
@@ -441,6 +441,10 @@ def _get_or_create_target(port: int, wanted_url: str) -> dict[str, Any]:
     raise GoogleMessageError("새 Chrome tab target을 만들지 못했습니다.")
 
 
+def _is_messages_target(target: dict[str, Any]) -> bool:
+    return target.get("type") == "page" and "messages.google.com/web" in target.get("url", "")
+
+
 def _activate_target(port: int, target_id: str) -> None:
     if not target_id:
         return
@@ -533,7 +537,11 @@ def fail_with_debug(
 
 
 def _click_point(cdp: CDPClient, x: float, y: float) -> None:
-    cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, timeout_s=5.0)
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseMoved", "x": x, "y": y, "button": "none", "pointerType": "mouse"},
+        timeout_s=5.0,
+    )
     cdp.call(
         "Input.dispatchMouseEvent",
         {
@@ -541,10 +549,13 @@ def _click_point(cdp: CDPClient, x: float, y: float) -> None:
             "x": x,
             "y": y,
             "button": "left",
+            "buttons": 1,
             "clickCount": 1,
+            "pointerType": "mouse",
         },
         timeout_s=5.0,
     )
+    time.sleep(0.05)
     cdp.call(
         "Input.dispatchMouseEvent",
         {
@@ -552,7 +563,9 @@ def _click_point(cdp: CDPClient, x: float, y: float) -> None:
             "x": x,
             "y": y,
             "button": "left",
+            "buttons": 0,
             "clickCount": 1,
+            "pointerType": "mouse",
         },
         timeout_s=5.0,
     )
@@ -595,6 +608,22 @@ def _find_start_chat(cdp: CDPClient) -> dict[str, Any]:
         (() => {{
           const re = new RegExp({_js_regex(START_CHAT_PATTERN)}, 'i');
           {_visible_helper_js()}
+          const preferred = document.querySelector('[data-e2e-start-button], mw-fab-link.start-chat a, a[href*="/web/conversations/new"]');
+          if (preferred && visible(preferred)) {{
+            const label = [
+              preferred.getAttribute('aria-label') || '',
+              preferred.getAttribute('title') || '',
+              preferred.innerText || '',
+              preferred.textContent || ''
+            ].join(' ').trim();
+            return {{
+              found: true,
+              selector: 'data-e2e-start-button',
+              label,
+              href: preferred.href || preferred.getAttribute('href') || '',
+              ...center(preferred)
+            }};
+          }}
           const selectors = [
             'button',
             'a',
@@ -609,7 +638,13 @@ def _find_start_chat(cdp: CDPClient) -> dict[str, Any]:
               el.textContent || ''
             ].join(' ').trim();
             if (visible(el) && re.test(label)) {{
-              return {{ found: true, label, ...center(el) }};
+              return {{
+                found: true,
+                selector: '',
+                label,
+                href: el.href || el.getAttribute('href') || '',
+                ...center(el)
+              }};
             }}
           }}
           return {{ found: false }};
@@ -617,6 +652,63 @@ def _find_start_chat(cdp: CDPClient) -> dict[str, Any]:
         """,
         timeout_s=5.0,
     ) or {"found": False}
+
+
+def _new_conversation_visible(cdp: CDPClient) -> bool:
+    return bool(
+        cdp.evaluate(
+            f"""
+            (() => {{
+              if (/\\/web\\/conversations\\/new(?:$|[?#/])/.test(location.pathname + location.search + location.hash)) {{
+                return true;
+              }}
+              const re = new RegExp({_js_regex(RECIPIENT_PATTERN)}, 'i');
+              {_visible_helper_js()}
+              const selectors = 'input, textarea, [contenteditable="true"], [role="textbox"]';
+              for (const el of document.querySelectorAll(selectors)) {{
+                if (!visible(el)) continue;
+                const label = [
+                  el.getAttribute('aria-label') || '',
+                  el.getAttribute('placeholder') || '',
+                  el.getAttribute('title') || '',
+                  el.getAttribute('name') || '',
+                  el.innerText || '',
+                  el.textContent || ''
+                ].join(' ');
+                if (re.test(label)) return true;
+              }}
+              return false;
+            }})()
+            """,
+            timeout_s=3.0,
+        )
+    )
+
+
+def _route_to_new_conversation(cdp: CDPClient) -> str:
+    current_origin = cdp.evaluate("location.origin", timeout_s=3.0) or "https://messages.google.com"
+    target_url = urllib.parse.urljoin(str(current_origin), "/web/conversations/new")
+    cdp.evaluate(
+        """
+        (() => {
+          const anchor = document.querySelector('[data-e2e-start-button], mw-fab-link.start-chat a, a[href*="/web/conversations/new"]');
+          if (anchor) {
+            anchor.click();
+          }
+          return true;
+        })()
+        """,
+        timeout_s=5.0,
+    )
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if _new_conversation_visible(cdp):
+            return "dom_click"
+        time.sleep(0.2)
+
+    if not _new_conversation_visible(cdp):
+        cdp.call("Page.navigate", {"url": target_url}, timeout_s=10.0)
+    return "navigate"
 
 
 def wait_for_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
@@ -686,6 +778,44 @@ def step1_open_messages(cdp: CDPClient, args: argparse.Namespace) -> None:
     print("[Step 1] '채팅 시작/Start chat' 버튼을 확인했습니다.")
 
 
+def use_existing_messages_page(cdp: CDPClient, args: argparse.Namespace) -> None:
+    cdp.call("Page.enable", timeout_s=5.0)
+    cdp.call("Runtime.enable", timeout_s=5.0)
+    cdp.call("Page.bringToFront", timeout_s=5.0)
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            state = cdp.evaluate("document.readyState", timeout_s=2.0)
+        except CDPError:
+            time.sleep(0.2)
+            continue
+        if state in ("interactive", "complete"):
+            break
+        time.sleep(0.2)
+
+    current_url = cdp.evaluate("location.href", timeout_s=3.0)
+    print(f"[Step 1] 이미 열린 Google Messages 탭을 감지했습니다: {current_url}")
+
+    body = _body_text(cdp)
+    if UNSAFE_BROWSER_RE.search(body):
+        fail_with_debug(
+            cdp,
+            args,
+            "unsafe_browser",
+            "Google 로그인 화면에서 '브라우저 또는 앱이 안전하지 않을 수 있습니다' 메시지가 감지됐습니다. "
+            "Selenium/ChromeDriver가 아니라 실제 Chrome CDP 프로필을 사용해야 합니다. "
+            "기본 실행값의 전용 Chrome 프로필에서 직접 로그인/페어링한 뒤 다시 실행하세요.",
+        )
+
+    if _new_conversation_visible(cdp) or _find_start_chat(cdp).get("found"):
+        print("[Step 1] 페이지 열기 단계는 생략하고 Step 2부터 시작합니다.")
+        return
+
+    wait_for_start_chat(cdp, args)
+    print("[Step 1] 페이지 열기 단계는 생략하고 Step 2부터 시작합니다.")
+
+
 def click_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
     info = _find_start_chat(cdp)
     if not info.get("found"):
@@ -697,7 +827,30 @@ def click_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
         )
 
     _click_point(cdp, float(info["x"]), float(info["y"]))
-    print("[Step 2] 채팅 시작 버튼을 클릭했습니다.")
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if _new_conversation_visible(cdp):
+            print("[Step 2] 채팅 시작 버튼을 클릭했습니다.")
+            return
+        time.sleep(0.2)
+
+    fallback = _route_to_new_conversation(cdp)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _new_conversation_visible(cdp):
+            if fallback == "dom_click":
+                print("[Step 2] 채팅 시작 버튼을 클릭했습니다. (DOM click fallback)")
+            else:
+                print("[Step 2] 채팅 시작 화면으로 이동했습니다. (route fallback)")
+            return
+        time.sleep(0.2)
+
+    fail_with_debug(
+        cdp,
+        args,
+        "click_start_chat_no_route",
+        "채팅 시작 버튼을 클릭/라우팅했지만 새 대화 화면으로 이동하지 못했습니다.",
+    )
 
 
 def _focus_and_clear_recipient_input(cdp: CDPClient) -> dict[str, Any]:
@@ -905,11 +1058,14 @@ def confirm_recipient(cdp: CDPClient, args: argparse.Namespace, phone: str) -> N
 
 
 def step2_start_chat_and_phone(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
-    click_start_chat(cdp, args)
-    time.sleep(0.5)
+    if _new_conversation_visible(cdp):
+        print("[Step 2] 이미 채팅 시작 화면입니다. 버튼 클릭은 생략합니다.")
+    else:
+        click_start_chat(cdp, args)
+        time.sleep(0.5)
     enter_phone_number(cdp, args, phone)
-    if args.fill_only:
-        print("[Step 2] --fill-only 옵션으로 수신자 확정은 생략했습니다.")
+    if not args.confirm_recipient:
+        print("[Step 2] 전화번호 입력까지 완료했습니다. 수신자 확정/메시지 전송은 하지 않습니다.")
         return
     confirm_recipient(cdp, args, phone)
 
@@ -951,7 +1107,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--fill-only",
         action="store_true",
-        help="전화번호 입력까지만 하고 후보 선택/Enter 확정은 하지 않습니다.",
+        help="호환용 옵션입니다. 기본 동작이 이미 전화번호 입력까지만 수행합니다.",
+    )
+    parser.add_argument(
+        "--confirm-recipient",
+        action="store_true",
+        help="전화번호 입력 후 후보 선택/Enter 로 수신자 확정까지 수행합니다.",
     )
     parser.add_argument(
         "--debug-dir",
@@ -973,11 +1134,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def run(args: argparse.Namespace) -> int:
     ensure_chrome_cdp(args)
     target = _get_or_create_target(args.port, args.url)
+    already_open = _is_messages_target(target)
     _activate_target(args.port, target.get("id", ""))
 
     cdp = CDPClient(target["webSocketDebuggerUrl"])
     try:
-        step1_open_messages(cdp, args)
+        if already_open:
+            use_existing_messages_page(cdp, args)
+        else:
+            step1_open_messages(cdp, args)
         step2_start_chat_and_phone(cdp, args, args.phone.strip())
         print("[완료] Step 1~2 성공.")
     finally:

@@ -6,7 +6,7 @@ Google Messages Web 에서 다음 단계까지만 자동화합니다.
 - [x] Step 1 - `https://messages.google.com/web/conversations` 열기
 - [x] Step 2 - `채팅 시작 / Start chat` 클릭
 - [x] Step 2 - 전화번호 입력
-- [x] Step 2 - 전화번호 후보 선택 또는 `Enter` 로 수신자 확정
+- [ ] Step 2 옵션 - 전화번호 후보 선택 또는 `Enter` 로 수신자 확정
 - [ ] 메시지 작성/전송 - 구현하지 않음
 
 ## 핵심 방식
@@ -46,19 +46,21 @@ python google_message.py
 
 기본 실행 흐름:
 
-1. `~/.google_message_chrome_profile` 전용 프로필로 실제 Chrome을 실행합니다.
-2. Google Messages Web 페이지를 엽니다.
-3. 처음 실행이면 Chrome 창에서 직접 Google 로그인 또는 Messages 휴대전화 페어링을 완료합니다.
-4. `채팅 시작 / Start chat` 버튼이 보이면 자동으로 클릭합니다.
-5. 전화번호를 입력하고 수신자 후보를 선택하거나 `Enter` 로 확정합니다.
-6. 메시지 입력창이 뜨면 성공으로 종료합니다. 메시지는 보내지 않습니다.
+1. 스크립트 폴더의 `.google_messages_chrome_profile` 전용 프로필로 실제 Chrome을 실행합니다.
+2. 이미 열린 Google Messages 탭이 있으면 그 탭을 감지하고 페이지 열기 단계를 생략합니다.
+3. 열린 탭이 없으면 Google Messages Web 페이지를 엽니다.
+4. 처음 실행이면 Chrome 창에서 직접 Google 로그인 또는 Messages 휴대전화 페어링을 완료합니다.
+5. `채팅 시작 / Start chat` 버튼이 보이면 자동으로 클릭합니다.
+6. 이미 새 대화 화면이면 버튼 클릭도 생략하고 전화번호 입력부터 진행합니다.
+7. 전화번호를 입력하고 성공으로 종료합니다. 수신자 확정과 메시지 전송은 하지 않습니다.
 
-## 수신자 확정 없이 입력까지만
+## 수신자 확정까지 실행
 
-전화번호 입력창에 번호만 넣고 멈추려면:
+기본 동작은 전화번호 입력까지만 하고 멈춥니다. 수신자 후보 선택 또는 `Enter` 확정까지
+실행하려면:
 
 ```bash
-python google_message.py "+821012345678" --fill-only
+python google_message.py "+821012345678" --confirm-recipient
 ```
 
 ## 이미 열린 CDP Chrome에 붙기
@@ -70,7 +72,7 @@ macOS:
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/.google_message_chrome_profile"
+  --user-data-dir="/Users/ijungyu/doing/auto/.google_messages_chrome_profile"
 
 python3 google_message.py "+821012345678" --attach-only
 ```
@@ -80,7 +82,7 @@ Windows PowerShell:
 ```powershell
 & "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
   --remote-debugging-port=9222 `
-  --user-data-dir="$env:USERPROFILE\.google_message_chrome_profile"
+  --user-data-dir="C:\path\to\auto\.google_messages_chrome_profile"
 
 python google_message.py "+821012345678" --attach-only
 ```
@@ -105,7 +107,7 @@ python google_message.py "+821012345678" \
 - `--user-data-dir` - 전용 Chrome 프로필 경로 지정
 - `--profile-directory` - Chrome profile-directory 지정
 - `--login-timeout` - 로그인/페어링 및 Start chat 버튼 대기 시간
-- `--fill-only` - 전화번호 입력까지만 수행
+- `--confirm-recipient` - 전화번호 입력 후 수신자 확정까지 수행
 - `--debug-dir` - 실패 시 screenshot/html 저장 위치
 
 ## 실패 시 확인
