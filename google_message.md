@@ -6,7 +6,7 @@ Google Messages Web 에서 다음 단계까지만 자동화합니다.
 - [x] Step 1 - `https://messages.google.com/web/conversations` 열기
 - [x] Step 2 - `채팅 시작 / Start chat` 클릭
 - [x] Step 2 - 전화번호 입력
-- [ ] Step 2 옵션 - 전화번호 후보 선택 또는 `Enter` 로 수신자 확정
+- [x] Step 3 - `~번으로 보내기` 버튼 클릭
 - [ ] 메시지 작성/전송 - 구현하지 않음
 
 ## 핵심 방식
@@ -52,15 +52,15 @@ python google_message.py
 4. 처음 실행이면 Chrome 창에서 직접 Google 로그인 또는 Messages 휴대전화 페어링을 완료합니다.
 5. `채팅 시작 / Start chat` 버튼이 보이면 자동으로 클릭합니다.
 6. 이미 새 대화 화면이면 버튼 클릭도 생략하고 전화번호 입력부터 진행합니다.
-7. 전화번호를 입력하고 성공으로 종료합니다. 수신자 확정과 메시지 전송은 하지 않습니다.
+7. `~번으로 보내기` 버튼을 클릭하고 메시지 입력창이 뜨면 성공으로 종료합니다.
+   메시지 작성과 전송은 하지 않습니다.
 
-## 수신자 확정까지 실행
+## 전화번호 입력까지만 실행
 
-기본 동작은 전화번호 입력까지만 하고 멈춥니다. 수신자 후보 선택 또는 `Enter` 확정까지
-실행하려면:
+기본 동작은 Step 3까지 실행합니다. 전화번호 입력까지만 하고 멈추려면:
 
 ```bash
-python google_message.py "+821012345678" --confirm-recipient
+python google_message.py "+821012345678" --fill-only
 ```
 
 ## 이미 열린 CDP Chrome에 붙기
@@ -107,7 +107,7 @@ python google_message.py "+821012345678" \
 - `--user-data-dir` - 전용 Chrome 프로필 경로 지정
 - `--profile-directory` - Chrome profile-directory 지정
 - `--login-timeout` - 로그인/페어링 및 Start chat 버튼 대기 시간
-- `--confirm-recipient` - 전화번호 입력 후 수신자 확정까지 수행
+- `--fill-only` - Step 2까지만 수행하고 `~번으로 보내기` 클릭은 생략
 - `--debug-dir` - 실패 시 screenshot/html 저장 위치
 
 ## 실패 시 확인

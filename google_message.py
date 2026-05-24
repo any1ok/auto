@@ -1,7 +1,8 @@
 """Google Messages Web automation without third-party packages.
 
 Step 1: Open https://messages.google.com/web/conversations in real Chrome.
-Step 2: Click Start chat, enter a phone number, and select/confirm it.
+Step 2: Click Start chat and enter a phone number.
+Step 3: Click the "Send to {phone}" / "{phone} 번으로 보내기" button.
 
 This script intentionally does not use Selenium, ChromeDriver, or Playwright.
 It launches or attaches to a visible, installed Chrome instance through the
@@ -48,6 +49,7 @@ RECIPIENT_PATTERN = (
 COMPOSER_PATTERN = (
     r"(Text\s*message|RCS\s*message|Type\s*a\s*message|Message|문자\s*메시지|메시지\s*입력)"
 )
+SEND_TO_PATTERN = r"(번으로\s*보내기|Send\s+to|Text\s+)"
 UNSAFE_BROWSER_RE = re.compile(
     r"(browser or app may not be secure|브라우저 또는 앱이 안전하지 않을 수|"
     r"앱이 안전하지 않을 수|couldn'?t sign you in|로그인할 수 없음)",
@@ -659,11 +661,12 @@ def _new_conversation_visible(cdp: CDPClient) -> bool:
         cdp.evaluate(
             f"""
             (() => {{
-              if (/\\/web\\/conversations\\/new(?:$|[?#/])/.test(location.pathname + location.search + location.hash)) {{
-                return true;
-              }}
               const re = new RegExp({_js_regex(RECIPIENT_PATTERN)}, 'i');
+              const composerRe = new RegExp({_js_regex(COMPOSER_PATTERN)}, 'i');
               {_visible_helper_js()}
+              const sendTo = document.querySelector('[data-e2e-send-to-button]');
+              if (sendTo && visible(sendTo)) return true;
+              const isNewPath = /\\/web\\/conversations\\/new(?:$|[?#/])/.test(location.pathname + location.search + location.hash);
               const selectors = 'input, textarea, [contenteditable="true"], [role="textbox"]';
               for (const el of document.querySelectorAll(selectors)) {{
                 if (!visible(el)) continue;
@@ -676,6 +679,7 @@ def _new_conversation_visible(cdp: CDPClient) -> bool:
                   el.textContent || ''
                 ].join(' ');
                 if (re.test(label)) return true;
+                if (isNewPath && !composerRe.test(label)) return true;
               }}
               return false;
             }})()
@@ -858,6 +862,7 @@ def _focus_and_clear_recipient_input(cdp: CDPClient) -> dict[str, Any]:
         f"""
         (() => {{
           const re = new RegExp({_js_regex(RECIPIENT_PATTERN)}, 'i');
+          const composerRe = new RegExp({_js_regex(COMPOSER_PATTERN)}, 'i');
           {_visible_helper_js()}
           const selectors = [
             'input',
@@ -866,9 +871,20 @@ def _focus_and_clear_recipient_input(cdp: CDPClient) -> dict[str, Any]:
             '[role="textbox"]'
           ].join(',');
           const nodes = Array.from(document.querySelectorAll(selectors)).filter(visible);
+          const candidates = nodes.filter((el) => {{
+            const label = [
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('placeholder') || '',
+              el.getAttribute('title') || '',
+              el.getAttribute('name') || '',
+              el.innerText || '',
+              el.textContent || ''
+            ].join(' ');
+            return !composerRe.test(label);
+          }});
 
           let picked = null;
-          for (const el of nodes) {{
+          for (const el of candidates) {{
             const label = [
               el.getAttribute('aria-label') || '',
               el.getAttribute('placeholder') || '',
@@ -882,7 +898,7 @@ def _focus_and_clear_recipient_input(cdp: CDPClient) -> dict[str, Any]:
               break;
             }}
           }}
-          if (!picked && nodes.length) picked = nodes[0];
+          if (!picked && candidates.length) picked = candidates[0];
           if (!picked) return {{ found: false }};
 
           picked.focus();
@@ -995,6 +1011,89 @@ def _find_phone_candidate(cdp: CDPClient, phone: str) -> dict[str, Any]:
     ) or {"found": False}
 
 
+def _find_send_to_number_button(cdp: CDPClient, phone: str) -> dict[str, Any]:
+    digits = _normalize_digits(phone)
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          const digits = {json.dumps(digits)};
+          const normalize = (s) => String(s || '').replace(/\\D+/g, '');
+          const sendRe = new RegExp({_js_regex(SEND_TO_PATTERN)}, 'i');
+          {_visible_helper_js()}
+          const wanted = [digits, digits.slice(-10), digits.slice(-8)]
+            .filter((v, i, arr) => v.length >= 7 && arr.indexOf(v) === i);
+
+          const score = (el) => {{
+            if (!visible(el)) return -1;
+            const text = [
+              el.innerText || '',
+              el.textContent || '',
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('title') || ''
+            ].join(' ').replace(/\\s+/g, ' ').trim();
+            const textDigits = normalize(text);
+            if (!wanted.some((part) => textDigits.includes(part))) return -1;
+            const hasE2e = el.hasAttribute('data-e2e-send-to-button') ? 100 : 0;
+            const hasSendText = sendRe.test(text) ? 20 : 0;
+            return hasE2e + hasSendText + Math.min(textDigits.length, 20);
+          }};
+
+          const selectors = [
+            '[data-e2e-send-to-button]',
+            'button',
+            'a',
+            '[role="button"]',
+            '[role="option"]',
+            '[role="listitem"]',
+            'li',
+            'mat-option',
+            '.mat-mdc-option',
+            'mws-contact-list-item',
+            'mws-contact-row'
+          ].join(',');
+          let best = null;
+          let bestScore = -1;
+          for (const el of document.querySelectorAll(selectors)) {{
+            const s = score(el);
+            if (s > bestScore) {{
+              best = el;
+              bestScore = s;
+            }}
+          }}
+          if (!best || bestScore < 0) return {{ found: false }};
+          const text = (best.innerText || best.textContent || best.getAttribute('aria-label') || '')
+            .replace(/\\s+/g, ' ')
+            .trim();
+          best.setAttribute('data-codex-send-to-target', 'true');
+          return {{
+            found: true,
+            text,
+            score: bestScore,
+            selector: best.hasAttribute('data-e2e-send-to-button') ? 'data-e2e-send-to-button' : '',
+            ...center(best)
+          }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
+def _click_send_to_number_with_dom(cdp: CDPClient) -> bool:
+    return bool(
+        cdp.evaluate(
+            """
+            (() => {
+              const el = document.querySelector('[data-codex-send-to-target="true"]');
+              if (!el) return false;
+              el.click();
+              return true;
+            })()
+            """,
+            timeout_s=5.0,
+        )
+    )
+
+
 def _composer_visible(cdp: CDPClient) -> bool:
     return bool(
         cdp.evaluate(
@@ -1057,6 +1156,47 @@ def confirm_recipient(cdp: CDPClient, args: argparse.Namespace, phone: str) -> N
     )
 
 
+def step3_click_send_to_number(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
+    info: dict[str, Any] = {"found": False}
+    deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        info = _find_send_to_number_button(cdp, phone)
+        if info.get("found"):
+            break
+        time.sleep(0.25)
+
+    if not info.get("found"):
+        fail_with_debug(
+            cdp,
+            args,
+            "send_to_number_button_not_found",
+            f"'{phone} 번으로 보내기' 버튼을 찾지 못했습니다.",
+        )
+
+    _click_point(cdp, float(info["x"]), float(info["y"]))
+    composer_deadline = time.monotonic() + 5
+    while time.monotonic() < composer_deadline:
+        if _composer_visible(cdp):
+            print(f"[Step 3] '{info.get('text') or phone}' 버튼을 클릭했습니다.")
+            return
+        time.sleep(0.25)
+
+    if _click_send_to_number_with_dom(cdp):
+        composer_deadline = time.monotonic() + 8
+        while time.monotonic() < composer_deadline:
+            if _composer_visible(cdp):
+                print(f"[Step 3] '{info.get('text') or phone}' 버튼을 클릭했습니다. (DOM click fallback)")
+                return
+            time.sleep(0.25)
+
+    fail_with_debug(
+        cdp,
+        args,
+        "send_to_number_click_failed",
+        "'~번으로 보내기' 버튼을 클릭했지만 메시지 입력창이 나타나지 않았습니다.",
+    )
+
+
 def step2_start_chat_and_phone(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
     if _new_conversation_visible(cdp):
         print("[Step 2] 이미 채팅 시작 화면입니다. 버튼 클릭은 생략합니다.")
@@ -1064,15 +1204,15 @@ def step2_start_chat_and_phone(cdp: CDPClient, args: argparse.Namespace, phone: 
         click_start_chat(cdp, args)
         time.sleep(0.5)
     enter_phone_number(cdp, args, phone)
-    if not args.confirm_recipient:
-        print("[Step 2] 전화번호 입력까지 완료했습니다. 수신자 확정/메시지 전송은 하지 않습니다.")
-        return
-    confirm_recipient(cdp, args, phone)
+    print("[Step 2] 전화번호 입력까지 완료했습니다.")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Open Google Messages Web in real Chrome, click Start chat, and enter a phone number."
+        description=(
+            "Open Google Messages Web in real Chrome, click Start chat, "
+            "enter a phone number, and click the send-to-number button."
+        )
     )
     parser.add_argument("phone", nargs="?", help="입력할 전화번호. 생략하면 실행 중에 입력받습니다.")
     parser.add_argument("--phone", dest="phone_option", help="입력할 전화번호.")
@@ -1107,12 +1247,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--fill-only",
         action="store_true",
-        help="호환용 옵션입니다. 기본 동작이 이미 전화번호 입력까지만 수행합니다.",
+        help="Step 2(전화번호 입력)까지만 수행하고 Step 3 '~번으로 보내기' 클릭은 생략합니다.",
     )
     parser.add_argument(
         "--confirm-recipient",
         action="store_true",
-        help="전화번호 입력 후 후보 선택/Enter 로 수신자 확정까지 수행합니다.",
+        help="호환용 옵션입니다. 기본 동작이 이미 Step 3 수신자 선택까지 수행합니다.",
     )
     parser.add_argument(
         "--debug-dir",
@@ -1144,7 +1284,11 @@ def run(args: argparse.Namespace) -> int:
         else:
             step1_open_messages(cdp, args)
         step2_start_chat_and_phone(cdp, args, args.phone.strip())
-        print("[완료] Step 1~2 성공.")
+        if not args.fill_only:
+            step3_click_send_to_number(cdp, args, args.phone.strip())
+            print("[완료] Step 1~3 성공.")
+        else:
+            print("[완료] Step 1~2 성공.")
     finally:
         cdp.close()
 
