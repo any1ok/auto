@@ -65,6 +65,7 @@ FRIEND_ADD_FILL_VERIFY_POLL_INTERVAL_S = 0.03
 FRIEND_ADD_SUBMIT_INITIAL_WAIT_S = 1.1
 FRIEND_ADD_SUBMIT_VERIFY_TIMEOUT_S = 1.0
 FRIEND_ADD_CLOSE_TIMEOUT_S = 0.8
+FRIEND_ADD_ERROR_CONFIRM_DELAY_S = 0.05
 WM_CLOSE = 0x0010
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -306,6 +307,24 @@ def _has_profile_result(popover_hwnd: int) -> bool:
     return not _is_window_enabled(page)
 
 
+def _has_result_pane(popover_hwnd: int) -> bool:
+    user32, _ = _load_win32()
+    for child in _enum_direct_children(popover_hwnd):
+        if _get_class_name(child) != KAKAO_CHILD_WINDOW_CLASS:
+            continue
+        if not user32.IsWindowVisible(child):
+            continue
+        rect = _window_rect(child)
+        if rect is None:
+            continue
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+        if width >= 200 and height >= 60 and _visible_edit_count(child) == 0:
+            return True
+    return False
+
+
 def _wait_edit_text(edit_hwnd: int, expected: str) -> tuple[bool, str]:
     deadline = time.monotonic() + FRIEND_ADD_FILL_VERIFY_TIMEOUT_S
     last = _get_edit_text(edit_hwnd)
@@ -534,6 +553,10 @@ def step5_confirm_friend_add(popover_hwnd: int) -> bool:
     while time.monotonic() < deadline:
         current = _find_friend_flow_popup()
         if current is None or _has_profile_result(current):
+            break
+        if _has_result_pane(current):
+            time.sleep(FRIEND_ADD_ERROR_CONFIRM_DELAY_S)
+            current = _find_friend_flow_popup()
             break
         time.sleep(FRIEND_ADD_OPEN_POLL_INTERVAL_S)
 
