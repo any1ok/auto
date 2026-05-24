@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import ctypes.wintypes as wt
 import hashlib
 import json
 import os
@@ -170,6 +172,242 @@ def _wait_for_cdp(port: int, timeout_s: float) -> bool:
     return False
 
 
+_WINDOWS_SW_SHOW = 5
+_WINDOWS_SW_RESTORE = 9
+_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_windows_user32: Optional[Any] = None
+_windows_kernel32: Optional[Any] = None
+
+
+def _load_windows_api() -> tuple[Any, Any]:
+    global _windows_user32, _windows_kernel32
+    if _windows_user32 is not None and _windows_kernel32 is not None:
+        return _windows_user32, _windows_kernel32
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    enum_windows_proc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    user32._GoogleMessageEnumWindowsProc = enum_windows_proc
+
+    user32.EnumWindows.argtypes = [enum_windows_proc, wt.LPARAM]
+    user32.EnumWindows.restype = wt.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [wt.HWND]
+    user32.IsWindowVisible.restype = wt.BOOL
+    user32.IsIconic.argtypes = [wt.HWND]
+    user32.IsIconic.restype = wt.BOOL
+    user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wt.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wt.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wt.DWORD
+    user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+    user32.AttachThreadInput.restype = wt.BOOL
+    user32.BringWindowToTop.argtypes = [wt.HWND]
+    user32.BringWindowToTop.restype = wt.BOOL
+    user32.SetForegroundWindow.argtypes = [wt.HWND]
+    user32.SetForegroundWindow.restype = wt.BOOL
+
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wt.DWORD
+    kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel32.OpenProcess.restype = wt.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wt.HANDLE,
+        wt.DWORD,
+        wt.LPWSTR,
+        ctypes.POINTER(wt.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.CloseHandle.restype = wt.BOOL
+
+    _windows_user32 = user32
+    _windows_kernel32 = kernel32
+    return user32, kernel32
+
+
+def _windows_hwnd_value(hwnd: Any) -> int:
+    value = getattr(hwnd, "value", hwnd)
+    return int(value or 0)
+
+
+def _windows_window_text(user32: Any, hwnd: int) -> str:
+    length = int(user32.GetWindowTextLengthW(hwnd))
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value
+
+
+def _windows_class_name(user32: Any, hwnd: int) -> str:
+    buffer = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buffer, len(buffer))
+    return buffer.value
+
+
+def _windows_process_image(kernel32: Any, pid: int) -> str:
+    handle = kernel32.OpenProcess(
+        _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        pid,
+    )
+    if not handle:
+        return ""
+    try:
+        size = wt.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _enum_chrome_windows_on_windows() -> list[dict[str, Any]]:
+    if platform.system() != "Windows":
+        return []
+
+    user32, kernel32 = _load_windows_api()
+    callback_type = user32._GoogleMessageEnumWindowsProc
+    windows: list[dict[str, Any]] = []
+
+    def callback(hwnd: Any, _lparam: Any) -> bool:
+        hwnd_value = _windows_hwnd_value(hwnd)
+        visible = bool(user32.IsWindowVisible(hwnd_value))
+        iconic = bool(user32.IsIconic(hwnd_value))
+        if not visible and not iconic:
+            return True
+
+        class_name = _windows_class_name(user32, hwnd_value)
+        if class_name and not class_name.startswith("Chrome_WidgetWin"):
+            return True
+
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd_value, ctypes.byref(pid))
+        if not pid.value:
+            return True
+
+        image_name = Path(_windows_process_image(kernel32, int(pid.value))).name.lower()
+        if image_name != "chrome.exe":
+            return True
+
+        windows.append(
+            {
+                "hwnd": hwnd_value,
+                "title": _windows_window_text(user32, hwnd_value),
+                "visible": visible,
+                "iconic": iconic,
+            }
+        )
+        return True
+
+    cb = callback_type(callback)
+    user32.EnumWindows(cb, 0)
+    return windows
+
+
+def _score_chrome_window_for_target(window: dict[str, Any], target: Optional[dict[str, Any]]) -> int:
+    title = str(window.get("title") or "")
+    title_l = title.lower()
+    target_title = str((target or {}).get("title") or "").strip()
+    target_title_l = target_title.lower()
+    target_url_l = str((target or {}).get("url") or "").lower()
+
+    score = 0
+    if target_title_l and target_title_l not in {"about:blank", "new tab"}:
+        if target_title_l in title_l:
+            score += 100
+    if "messages.google.com" in target_url_l:
+        score += 50
+    if "google messages" in title_l or "messages" in title_l:
+        score += 50
+    if window.get("visible"):
+        score += 10
+    if not window.get("iconic"):
+        score += 5
+    if title:
+        score += 1
+    return score
+
+
+def _force_windows_foreground(hwnd: int) -> bool:
+    user32, kernel32 = _load_windows_api()
+
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, _WINDOWS_SW_RESTORE)
+    else:
+        user32.ShowWindow(hwnd, _WINDOWS_SW_SHOW)
+
+    if _windows_hwnd_value(user32.GetForegroundWindow()) == hwnd:
+        return True
+
+    current_tid = kernel32.GetCurrentThreadId()
+    foreground_hwnd = _windows_hwnd_value(user32.GetForegroundWindow())
+    foreground_tid = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+    target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+
+    attached_foreground = False
+    attached_target = False
+    try:
+        if foreground_tid and foreground_tid != current_tid:
+            attached_foreground = bool(user32.AttachThreadInput(current_tid, foreground_tid, True))
+        if target_tid and target_tid != current_tid and target_tid != foreground_tid:
+            attached_target = bool(user32.AttachThreadInput(current_tid, target_tid, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached_target:
+            user32.AttachThreadInput(current_tid, target_tid, False)
+        if attached_foreground:
+            user32.AttachThreadInput(current_tid, foreground_tid, False)
+
+    return _windows_hwnd_value(user32.GetForegroundWindow()) == hwnd
+
+
+def _bring_chrome_window_to_front_on_windows(
+    target: Optional[dict[str, Any]] = None,
+    *,
+    reason: str = "Chrome",
+) -> bool:
+    if platform.system() != "Windows":
+        return False
+
+    try:
+        windows = _enum_chrome_windows_on_windows()
+        if not windows:
+            return False
+
+        chosen = max(windows, key=lambda item: _score_chrome_window_for_target(item, target))
+        focused = _force_windows_foreground(int(chosen["hwnd"]))
+        title = chosen.get("title") or "(no title)"
+        state = "foreground" if focused else "visible"
+        print(f"[Chrome] Windows {reason} window is {state}: {title}")
+        return focused
+    except Exception as exc:
+        print(f"[Chrome] Windows {reason} window foreground request skipped: {exc}", file=sys.stderr)
+        return False
+
+
+def _page_target_hint(cdp: "CDPClient", args: argparse.Namespace) -> dict[str, Any]:
+    hint: dict[str, Any] = {"url": args.url}
+    try:
+        title = cdp.evaluate("document.title", timeout_s=1.0)
+    except CDPError:
+        title = None
+    if isinstance(title, str) and title.strip():
+        hint["title"] = title.strip()
+    return hint
+
+
 def _launch_chrome_for_cdp(args: argparse.Namespace) -> subprocess.Popen:
     chrome = _find_chrome_executable(args.chrome_executable)
     profile_dir = Path(args.user_data_dir).expanduser() if args.user_data_dir else DEFAULT_PROFILE_DIR
@@ -204,6 +442,7 @@ def _launch_chrome_for_cdp(args: argparse.Namespace) -> subprocess.Popen:
 
 def ensure_chrome_cdp(args: argparse.Namespace) -> str:
     if _is_cdp_ready(args.port):
+        _bring_chrome_window_to_front_on_windows(reason="CDP")
         print(f"[Chrome] 실행 중인 Chrome CDP 세션에 연결합니다: 127.0.0.1:{args.port}")
         return f"http://127.0.0.1:{args.port}"
 
@@ -219,6 +458,7 @@ def ensure_chrome_cdp(args: argparse.Namespace) -> str:
             "Chrome은 실행했지만 CDP 포트가 열리지 않았습니다. "
             "이미 같은 user-data-dir 로 열린 Chrome이 있거나 Chrome 정책이 원격 디버깅을 막고 있을 수 있습니다."
         )
+    _bring_chrome_window_to_front_on_windows(reason="launched Chrome")
     return f"http://127.0.0.1:{args.port}"
 
 
@@ -774,6 +1014,7 @@ def step1_open_messages(cdp: CDPClient, args: argparse.Namespace) -> None:
     cdp.call("Page.enable", timeout_s=5.0)
     cdp.call("Runtime.enable", timeout_s=5.0)
     cdp.call("Page.bringToFront", timeout_s=5.0)
+    _bring_chrome_window_to_front_on_windows(_page_target_hint(cdp, args), reason="Step 1")
     cdp.call("Page.navigate", {"url": args.url}, timeout_s=10.0)
 
     deadline = time.monotonic() + 60
@@ -788,6 +1029,7 @@ def step1_open_messages(cdp: CDPClient, args: argparse.Namespace) -> None:
         time.sleep(0.2)
 
     cdp.call("Page.bringToFront", timeout_s=5.0)
+    _bring_chrome_window_to_front_on_windows(_page_target_hint(cdp, args), reason="Step 1")
     print(f"[Step 1] Google Messages 페이지를 Chrome에 열었습니다: {args.url}")
     wait_for_start_chat(cdp, args)
     print("[Step 1] '채팅 시작/Start chat' 버튼을 확인했습니다.")
@@ -797,6 +1039,7 @@ def use_existing_messages_page(cdp: CDPClient, args: argparse.Namespace) -> None
     cdp.call("Page.enable", timeout_s=5.0)
     cdp.call("Runtime.enable", timeout_s=5.0)
     cdp.call("Page.bringToFront", timeout_s=5.0)
+    _bring_chrome_window_to_front_on_windows({"url": args.url}, reason="existing Messages")
 
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
@@ -810,6 +1053,7 @@ def use_existing_messages_page(cdp: CDPClient, args: argparse.Namespace) -> None
         time.sleep(0.2)
 
     current_url = cdp.evaluate("location.href", timeout_s=3.0)
+    _bring_chrome_window_to_front_on_windows(_page_target_hint(cdp, args), reason="existing Messages")
     print(f"[Step 1] 이미 열린 Google Messages 탭을 감지했습니다: {current_url}")
 
     body = _body_text(cdp)
@@ -1640,6 +1884,7 @@ def run(args: argparse.Namespace) -> int:
     target = _get_or_create_target(args.port, args.url)
     already_open = _is_messages_target(target)
     _activate_target(args.port, target.get("id", ""))
+    _bring_chrome_window_to_front_on_windows(target, reason="target")
 
     cdp = CDPClient(target["webSocketDebuggerUrl"])
     try:
