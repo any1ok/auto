@@ -3,6 +3,7 @@
 Step 1: Open https://messages.google.com/web/conversations in real Chrome.
 Step 2: Click Start chat and enter a phone number.
 Step 3: Click the "Send to {phone}" / "{phone} 번으로 보내기" button.
+Step 4: Type a message and click Send.
 
 This script intentionally does not use Selenium, ChromeDriver, or Playwright.
 It launches or attaches to a visible, installed Chrome instance through the
@@ -1126,6 +1127,167 @@ def _composer_visible(cdp: CDPClient) -> bool:
     )
 
 
+def _find_message_composer(cdp: CDPClient) -> dict[str, Any]:
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          const re = new RegExp({_js_regex(COMPOSER_PATTERN)}, 'i');
+          {_visible_helper_js()}
+          const preferred = document.querySelector('[data-e2e-message-input-box]');
+          if (preferred && visible(preferred)) {{
+            return {{
+              found: true,
+              selector: 'data-e2e-message-input-box',
+              value: preferred.value || preferred.innerText || preferred.textContent || '',
+              ...center(preferred)
+            }};
+          }}
+          const selectors = [
+            'textarea',
+            'input',
+            '[contenteditable="true"]',
+            '[role="textbox"]'
+          ].join(',');
+          for (const el of document.querySelectorAll(selectors)) {{
+            if (!visible(el)) continue;
+            const label = [
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('placeholder') || '',
+              el.getAttribute('title') || '',
+              el.innerText || '',
+              el.textContent || ''
+            ].join(' ');
+            if (re.test(label)) {{
+              return {{
+                found: true,
+                selector: '',
+                value: el.value || el.innerText || el.textContent || '',
+                ...center(el)
+              }};
+            }}
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
+def _focus_and_clear_message_composer(cdp: CDPClient) -> dict[str, Any]:
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          const re = new RegExp({_js_regex(COMPOSER_PATTERN)}, 'i');
+          {_visible_helper_js()}
+          const candidates = [
+            ...document.querySelectorAll('[data-e2e-message-input-box]'),
+            ...document.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')
+          ];
+          for (const el of candidates) {{
+            if (!visible(el)) continue;
+            const label = [
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('placeholder') || '',
+              el.getAttribute('title') || '',
+              el.innerText || '',
+              el.textContent || ''
+            ].join(' ');
+            if (!el.hasAttribute('data-e2e-message-input-box') && !re.test(label)) continue;
+            el.focus();
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
+              el.value = '';
+            }} else {{
+              el.textContent = '';
+            }}
+            el.dispatchEvent(new InputEvent('input', {{
+              bubbles: true,
+              inputType: 'deleteContentBackward',
+              data: null
+            }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return {{ found: true, ...center(el) }};
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
+def _composer_contains_message(cdp: CDPClient, message: str) -> bool:
+    return bool(
+        cdp.evaluate(
+            f"""
+            (() => {{
+              const expected = {json.dumps(message)};
+              const el = document.querySelector('[data-e2e-message-input-box]');
+              if (el) {{
+                return (el.value || el.innerText || el.textContent || '') === expected;
+              }}
+              const selectors = 'textarea, input, [contenteditable="true"], [role="textbox"]';
+              for (const field of document.querySelectorAll(selectors)) {{
+                const value = field.value || field.innerText || field.textContent || '';
+                if (value === expected) return true;
+              }}
+              return false;
+            }})()
+            """,
+            timeout_s=3.0,
+        )
+    )
+
+
+def _composer_is_empty(cdp: CDPClient) -> bool:
+    return bool(
+        cdp.evaluate(
+            """
+            (() => {
+              const el = document.querySelector('[data-e2e-message-input-box]');
+              if (!el) return false;
+              return !(el.value || el.innerText || el.textContent || '').trim();
+            })()
+            """,
+            timeout_s=3.0,
+        )
+    )
+
+
+def _find_send_message_button(cdp: CDPClient) -> dict[str, Any]:
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          {_visible_helper_js()}
+          const selectors = [
+            '[data-e2e-send-text-button]',
+            'button[aria-label*="전송"]',
+            'button[aria-label*="Send" i]',
+            'button'
+          ].join(',');
+          for (const el of document.querySelectorAll(selectors)) {{
+            if (!visible(el)) continue;
+            const text = [
+              el.innerText || '',
+              el.textContent || '',
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('title') || ''
+            ].join(' ').replace(/\\s+/g, ' ').trim();
+            if (el.hasAttribute('data-e2e-send-text-button') || /전송|send/i.test(text)) {{
+              return {{
+                found: true,
+                text,
+                disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                selector: el.hasAttribute('data-e2e-send-text-button') ? 'data-e2e-send-text-button' : '',
+                ...center(el)
+              }};
+            }}
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
 def confirm_recipient(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
     deadline = time.monotonic() + min(4.0, args.action_timeout_ms / 1000)
     clicked_candidate = False
@@ -1197,6 +1359,80 @@ def step3_click_send_to_number(cdp: CDPClient, args: argparse.Namespace, phone: 
     )
 
 
+def step4_type_and_send_message(cdp: CDPClient, args: argparse.Namespace, message: str) -> None:
+    composer_deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+    composer: dict[str, Any] = {"found": False}
+    while time.monotonic() < composer_deadline:
+        composer = _focus_and_clear_message_composer(cdp)
+        if composer.get("found"):
+            break
+        time.sleep(0.25)
+
+    if not composer.get("found"):
+        fail_with_debug(
+            cdp,
+            args,
+            "message_composer_not_found",
+            "메시지 입력창을 찾지 못했습니다.",
+        )
+
+    _click_point(cdp, float(composer["x"]), float(composer["y"]))
+    _insert_text(cdp, message)
+
+    verify_deadline = time.monotonic() + 5
+    while time.monotonic() < verify_deadline:
+        if _composer_contains_message(cdp, message):
+            print(f"[Step 4] 메시지 입력 완료: {message!r}")
+            break
+        time.sleep(0.2)
+    else:
+        fail_with_debug(
+            cdp,
+            args,
+            "message_input_verify_failed",
+            "메시지를 입력했지만 입력창에서 본문을 확인하지 못했습니다.",
+        )
+
+    send_button_deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+    send_button: dict[str, Any] = {"found": False}
+    while time.monotonic() < send_button_deadline:
+        send_button = _find_send_message_button(cdp)
+        if send_button.get("found") and not send_button.get("disabled"):
+            break
+        time.sleep(0.25)
+
+    if not send_button.get("found"):
+        fail_with_debug(
+            cdp,
+            args,
+            "send_message_button_not_found",
+            "메시지 전송 버튼을 찾지 못했습니다.",
+        )
+    if send_button.get("disabled"):
+        fail_with_debug(
+            cdp,
+            args,
+            "send_message_button_disabled",
+            "메시지 전송 버튼이 비활성 상태입니다.",
+        )
+
+    _click_point(cdp, float(send_button["x"]), float(send_button["y"]))
+
+    sent_deadline = time.monotonic() + 12
+    while time.monotonic() < sent_deadline:
+        if _composer_is_empty(cdp):
+            print("[Step 4] 메시지 전송 완료.")
+            return
+        time.sleep(0.25)
+
+    fail_with_debug(
+        cdp,
+        args,
+        "message_send_verify_failed",
+        "전송 버튼을 클릭했지만 메시지 입력창이 비워지는 것을 확인하지 못했습니다.",
+    )
+
+
 def step2_start_chat_and_phone(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
     if _new_conversation_visible(cdp):
         print("[Step 2] 이미 채팅 시작 화면입니다. 버튼 클릭은 생략합니다.")
@@ -1215,7 +1451,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("phone", nargs="?", help="입력할 전화번호. 생략하면 실행 중에 입력받습니다.")
+    parser.add_argument(
+        "message",
+        nargs="?",
+        help="보낼 메시지. 생략하면 Step 3까지만 수행하고 전송하지 않습니다.",
+    )
     parser.add_argument("--phone", dest="phone_option", help="입력할 전화번호.")
+    parser.add_argument("--message", dest="message_option", help="보낼 메시지.")
     parser.add_argument("--url", default=MESSAGES_URL, help=f"열 URL. 기본값: {MESSAGES_URL}")
     parser.add_argument("--port", type=int, default=DEFAULT_DEBUG_PORT, help="Chrome CDP 포트.")
     parser.add_argument(
@@ -1262,12 +1504,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
     args.phone = args.phone_option or args.phone
+    args.message = args.message_option if args.message_option is not None else args.message
     if not args.phone:
         args.phone = input("전화번호: ").strip()
     if not args.phone.strip():
         parser.error("전화번호가 비어 있습니다.")
     if len(_normalize_digits(args.phone)) < 7:
         parser.error("전화번호 숫자가 너무 짧습니다.")
+    if args.message is not None and not args.message.strip():
+        parser.error("메시지가 비어 있습니다.")
     return args
 
 
@@ -1286,7 +1531,11 @@ def run(args: argparse.Namespace) -> int:
         step2_start_chat_and_phone(cdp, args, args.phone.strip())
         if not args.fill_only:
             step3_click_send_to_number(cdp, args, args.phone.strip())
-            print("[완료] Step 1~3 성공.")
+            if args.message is not None:
+                step4_type_and_send_message(cdp, args, args.message)
+                print("[완료] Step 1~4 성공.")
+            else:
+                print("[완료] Step 1~3 성공.")
         else:
             print("[완료] Step 1~2 성공.")
     finally:
