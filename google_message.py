@@ -1,7 +1,7 @@
 """Google Messages Web automation without third-party packages.
 
 Step 1: Open https://messages.google.com/web/conversations in real Chrome.
-Step 2: Click Start chat and enter a phone number.
+Step 2: Click Start chat, enter a phone number, and verify the contact name.
 Step 3: Click the "Send to {phone}" / "{phone} 번으로 보내기" button.
 Step 4: Type a message and click Send.
 
@@ -40,6 +40,7 @@ DEFAULT_DEBUG_PORT = 9222
 DEFAULT_PROFILE_DIR = Path(__file__).resolve().parent / ".google_messages_chrome_profile"
 DEFAULT_LOGIN_TIMEOUT_S = 180
 DEFAULT_ACTION_TIMEOUT_MS = 15_000
+CONTACT_VERIFY_TIMEOUT_S = 1.5
 
 START_CHAT_PATTERN = (
     r"(Start\s*chat|New\s*(chat|conversation)|채팅\s*시작|새\s*(채팅|대화)|대화\s*시작)"
@@ -68,6 +69,15 @@ class CDPError(GoogleMessageError):
 
 def _normalize_digits(value: str) -> str:
     return re.sub(r"\D+", "", value)
+
+
+def _normalize_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _looks_like_phone(value: str) -> bool:
+    digits = _normalize_digits(value)
+    return len(digits) >= 7 and bool(re.search(r"\d", value))
 
 
 def _chrome_candidates() -> list[Path]:
@@ -974,6 +984,70 @@ def enter_phone_number(cdp: CDPClient, args: argparse.Namespace, phone: str) -> 
     )
 
 
+def _find_contact_result(cdp: CDPClient, phone: str) -> dict[str, Any]:
+    digits = _normalize_digits(phone)
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          const digits = {json.dumps(digits)};
+          const normalizeDigits = (s) => String(s || '').replace(/\\D+/g, '');
+          {_visible_helper_js()}
+          const wanted = [digits, digits.slice(-10), digits.slice(-8)]
+            .filter((v, i, arr) => v.length >= 7 && arr.indexOf(v) === i);
+
+          for (const row of document.querySelectorAll('[data-e2e-contact-row]')) {{
+            if (!visible(row)) continue;
+            const nameEl = row.querySelector('[data-e2e-contact-name]');
+            const numberEl = row.querySelector('[data-e2e-contact-number]');
+            const name = (nameEl ? nameEl.innerText || nameEl.textContent || '' : '')
+              .replace(/\\s+/g, ' ')
+              .trim();
+            const number = (numberEl ? numberEl.innerText || numberEl.textContent || '' : '')
+              .replace(/\\s+/g, ' ')
+              .trim();
+            const rowText = (row.innerText || row.textContent || '').replace(/\\s+/g, ' ').trim();
+            const rowDigits = normalizeDigits(number || rowText);
+            if (wanted.some((part) => rowDigits.includes(part))) {{
+              return {{ found: true, name, number, text: rowText, ...center(row) }};
+            }}
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
+def verify_contact_name(
+    cdp: CDPClient,
+    args: argparse.Namespace,
+    expected_name: str,
+    phone: str,
+) -> None:
+    expected = _normalize_name(expected_name)
+    deadline = time.monotonic() + CONTACT_VERIFY_TIMEOUT_S
+    result: dict[str, Any] = {"found": False}
+
+    while time.monotonic() < deadline:
+        result = _find_contact_result(cdp, phone)
+        if result.get("found"):
+            break
+        time.sleep(0.15)
+
+    if not result.get("found"):
+        raise GoogleMessageError(
+            f"연락처 이름 확인 실패: 전화번호 {phone!r}에 해당하는 연락처 결과가 없습니다."
+        )
+
+    actual = _normalize_name(str(result.get("name") or ""))
+    if actual != expected:
+        raise GoogleMessageError(
+            f"연락처 이름 불일치: 기대값={expected!r}, 화면값={actual!r}, 전화번호={phone!r}"
+        )
+
+    print(f"[Step 2] 연락처 이름 확인 완료: {actual!r}")
+
+
 def _find_phone_candidate(cdp: CDPClient, phone: str) -> dict[str, Any]:
     digits = _normalize_digits(phone)
     return cdp.evaluate(
@@ -1433,13 +1507,22 @@ def step4_type_and_send_message(cdp: CDPClient, args: argparse.Namespace, messag
     )
 
 
-def step2_start_chat_and_phone(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
+def step2_start_chat_and_phone(
+    cdp: CDPClient,
+    args: argparse.Namespace,
+    expected_name: Optional[str],
+    phone: str,
+) -> None:
     if _new_conversation_visible(cdp):
         print("[Step 2] 이미 채팅 시작 화면입니다. 버튼 클릭은 생략합니다.")
     else:
         click_start_chat(cdp, args)
         time.sleep(0.5)
     enter_phone_number(cdp, args, phone)
+    if expected_name:
+        verify_contact_name(cdp, args, expected_name, phone)
+    else:
+        print("[Step 2] 이름 입력이 없어 연락처 이름 검증을 생략합니다.")
     print("[Step 2] 전화번호 입력까지 완료했습니다.")
 
 
@@ -1447,15 +1530,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Open Google Messages Web in real Chrome, click Start chat, "
-            "enter a phone number, and click the send-to-number button."
+            "optionally verify a contact name, enter a phone number, and send a message."
         )
     )
-    parser.add_argument("phone", nargs="?", help="입력할 전화번호. 생략하면 실행 중에 입력받습니다.")
     parser.add_argument(
-        "message",
-        nargs="?",
-        help="보낼 메시지. 생략하면 Step 3까지만 수행하고 전송하지 않습니다.",
+        "values",
+        nargs="*",
+        help="입력값. 형식: [이름] 전화번호 메시지",
     )
+    parser.add_argument("--name", dest="name_option", help="기대하는 연락처 이름.")
     parser.add_argument("--phone", dest="phone_option", help="입력할 전화번호.")
     parser.add_argument("--message", dest="message_option", help="보낼 메시지.")
     parser.add_argument("--url", default=MESSAGES_URL, help=f"열 URL. 기본값: {MESSAGES_URL}")
@@ -1503,14 +1586,50 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
 
     args = parser.parse_args(argv)
-    args.phone = args.phone_option or args.phone
-    args.message = args.message_option if args.message_option is not None else args.message
+    values = list(args.values)
+    if len(values) > 3:
+        parser.error("positional 인자는 최대 3개입니다: [이름] 전화번호 메시지")
+
+    name = args.name_option
+    phone = args.phone_option
+    message = args.message_option
+
+    if phone is None:
+        if values:
+            first = values.pop(0)
+            if name is None and _looks_like_phone(first):
+                phone = first
+            elif name is None:
+                name = first
+                if values:
+                    phone = values.pop(0)
+            else:
+                phone = first
+    elif name is None and values and not _looks_like_phone(values[0]) and message is not None:
+        name = values.pop(0)
+
+    if message is None and values:
+        message = values.pop(0)
+
+    if values:
+        parser.error("남는 positional 인자가 있습니다. 형식: [이름] 전화번호 메시지")
+
+    if name is None and phone is None:
+        maybe_name = input("이름(선택, 없으면 Enter): ").strip()
+        name = maybe_name or None
+
+    args.name = _normalize_name(name) if name else None
+    args.phone = phone
+    args.message = message
+
     if not args.phone:
         args.phone = input("전화번호: ").strip()
     if not args.phone.strip():
         parser.error("전화번호가 비어 있습니다.")
     if len(_normalize_digits(args.phone)) < 7:
         parser.error("전화번호 숫자가 너무 짧습니다.")
+    if not args.fill_only and args.message is None:
+        args.message = input("메시지: ").strip()
     if args.message is not None and not args.message.strip():
         parser.error("메시지가 비어 있습니다.")
     return args
@@ -1528,7 +1647,12 @@ def run(args: argparse.Namespace) -> int:
             use_existing_messages_page(cdp, args)
         else:
             step1_open_messages(cdp, args)
-        step2_start_chat_and_phone(cdp, args, args.phone.strip())
+        step2_start_chat_and_phone(
+            cdp,
+            args,
+            args.name.strip() if args.name else None,
+            args.phone.strip(),
+        )
         if not args.fill_only:
             step3_click_send_to_number(cdp, args, args.phone.strip())
             if args.message is not None:
