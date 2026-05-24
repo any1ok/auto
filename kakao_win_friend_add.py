@@ -70,6 +70,32 @@ WM_CLOSE = 0x0010
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
+_extra_user32_bound = False
+
+
+def _load_user32_extra() -> ctypes.WinDLL:
+    """kakao_win 공용 바인딩에 없는 작은 user32 API 들을 한 번만 지정."""
+    global _extra_user32_bound
+    user32, _ = _load_win32()
+    if _extra_user32_bound:
+        return user32
+
+    user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+    user32.GetWindowRect.restype = wt.BOOL
+    user32.IsWindow.argtypes = [wt.HWND]
+    user32.IsWindow.restype = wt.BOOL
+    user32.IsWindowEnabled.argtypes = [wt.HWND]
+    user32.IsWindowEnabled.restype = wt.BOOL
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = wt.BOOL
+    user32.mouse_event.argtypes = [
+        wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_void_p,
+    ]
+    user32.mouse_event.restype = None
+
+    _extra_user32_bound = True
+    return user32
+
 
 def _window_text(hwnd: int) -> str:
     user32, _ = _load_win32()
@@ -82,10 +108,7 @@ def _window_text(hwnd: int) -> str:
 
 
 def _window_rect(hwnd: int) -> Optional[tuple[int, int, int, int]]:
-    user32, _ = _load_win32()
-    user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
-    user32.GetWindowRect.restype = wt.BOOL
-
+    user32 = _load_user32_extra()
     rect = wt.RECT()
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
@@ -93,9 +116,7 @@ def _window_rect(hwnd: int) -> Optional[tuple[int, int, int, int]]:
 
 
 def _is_window_enabled(hwnd: int) -> bool:
-    user32, _ = _load_win32()
-    user32.IsWindowEnabled.argtypes = [wt.HWND]
-    user32.IsWindowEnabled.restype = wt.BOOL
+    user32 = _load_user32_extra()
     return bool(user32.IsWindowEnabled(hwnd))
 
 
@@ -105,9 +126,7 @@ def _is_window_visible(hwnd: int) -> bool:
 
 
 def _is_window(hwnd: int) -> bool:
-    user32, _ = _load_win32()
-    user32.IsWindow.argtypes = [wt.HWND]
-    user32.IsWindow.restype = wt.BOOL
+    user32 = _load_user32_extra()
     return bool(user32.IsWindow(hwnd))
 
 
@@ -119,24 +138,22 @@ def _window_size(hwnd: int) -> Optional[tuple[int, int]]:
     return right - left, bottom - top
 
 
-def _click_relative(hwnd: int, x: int, y: int) -> None:
-    rect = _window_rect(hwnd)
-    if rect is None:
-        raise KakaoWinError(f"창 좌표를 읽지 못했습니다 (hwnd=0x{hwnd:08X}).")
-    left, top, _right, _bottom = rect
-    user32, _ = _load_win32()
-    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-    user32.SetCursorPos.restype = wt.BOOL
-    user32.mouse_event.argtypes = [
-        wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_void_p,
-    ]
-    user32.mouse_event.restype = None
-    if not user32.SetCursorPos(left + x, top + y):
+def _click_at_screen_point(x: int, y: int) -> None:
+    user32 = _load_user32_extra()
+    if not user32.SetCursorPos(x, y):
         raise KakaoWinError("마우스 커서 이동에 실패했습니다.")
     time.sleep(0.03)
     user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
     time.sleep(0.03)
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
+
+
+def _click_relative(hwnd: int, x: int, y: int) -> None:
+    rect = _window_rect(hwnd)
+    if rect is None:
+        raise KakaoWinError(f"창 좌표를 읽지 못했습니다 (hwnd=0x{hwnd:08X}).")
+    left, top, _right, _bottom = rect
+    _click_at_screen_point(left + x, top + y)
 
 
 def _click_center(hwnd: int) -> None:
@@ -144,19 +161,7 @@ def _click_center(hwnd: int) -> None:
     if rect is None:
         raise KakaoWinError(f"창 좌표를 읽지 못했습니다 (hwnd=0x{hwnd:08X}).")
     left, top, right, bottom = rect
-    user32, _ = _load_win32()
-    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-    user32.SetCursorPos.restype = wt.BOOL
-    user32.mouse_event.argtypes = [
-        wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_void_p,
-    ]
-    user32.mouse_event.restype = None
-    if not user32.SetCursorPos((left + right) // 2, (top + bottom) // 2):
-        raise KakaoWinError("마우스 커서 이동에 실패했습니다.")
-    time.sleep(0.03)
-    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
-    time.sleep(0.03)
-    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
+    _click_at_screen_point((left + right) // 2, (top + bottom) // 2)
 
 
 def _enum_descendants(parent_hwnd: int) -> list[int]:
@@ -226,6 +231,31 @@ def _find_friend_add_window(
     return None
 
 
+def _reuse_or_close_existing_flow_popup(detail: str = "") -> Optional[int]:
+    existing = _find_friend_flow_popup()
+    if existing is None:
+        return None
+
+    switched_to_contact = False
+    if _find_contact_fields(existing) is None and _visible_edit_count(existing) == 1:
+        _force_foreground(existing)
+        _click_relative(existing, 92, 142)
+        switched_to_contact = _find_contact_fields(existing) is not None
+
+    if _find_contact_fields(existing) is not None:
+        _force_foreground(existing)
+        note = "ID 탭 → 연락처 탭, " if switched_to_contact else ""
+        extra = f", {detail}" if detail else ""
+        print(
+            f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
+            f"({note}hwnd=0x{existing:08X}{extra})"
+        )
+        return existing
+
+    _close_friend_flow_popup(existing)
+    return None
+
+
 def _wait_friend_flow_popup_closed(
     hwnd: int,
     timeout_s: float = FRIEND_ADD_CLOSE_TIMEOUT_S,
@@ -254,6 +284,15 @@ def _close_friend_flow_popup(hwnd: int) -> bool:
     user32, _ = _load_win32()
     user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
     return _wait_friend_flow_popup_closed(hwnd)
+
+
+def _close_and_report_error(hwnd: int) -> bool:
+    _close_friend_flow_popup(hwnd)
+    print(
+        "[Step 5] 친구 추가 실패: 오류 상태로 판단해 팝오버를 닫았습니다.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _find_contact_fields(
@@ -363,7 +402,7 @@ def _paste_text_into_edit(edit_hwnd: int, text: str) -> None:
         f"입력칸 텍스트 검증 실패: expected={text!r}, actual={last_actual!r}, "
         f"edit=0x{edit_hwnd:08X}. 포커스 또는 클립보드 입력이 다른 "
         "컨트롤로 들어갔을 수 있습니다."
-        )
+    )
 
 
 def _dump_visible_kakao_windows_to_stderr() -> None:
@@ -399,34 +438,9 @@ def step3_open_friend_add_popover(hwnd: int) -> int:
     팝오버가 열린 동안 메인 창을 disabled 로 바꾸므로, 이미 열린 상태에서
     메인 창을 다시 foreground 로 잡거나 Step 2 를 반복하면 실패할 수 있다.
     """
-    existing_flow = _find_friend_flow_popup()
+    existing_flow = _reuse_or_close_existing_flow_popup()
     if existing_flow is not None:
-        if _find_contact_fields(existing_flow) is not None:
-            _force_foreground(existing_flow)
-            print(
-                f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
-                f"(hwnd=0x{existing_flow:08X})"
-            )
-            return existing_flow
-        if _visible_edit_count(existing_flow) == 1:
-            _force_foreground(existing_flow)
-            _click_relative(existing_flow, 92, 142)
-            if _find_contact_fields(existing_flow) is not None:
-                print(
-                    f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
-                    f"(ID 탭 → 연락처 탭, hwnd=0x{existing_flow:08X})"
-                )
-                return existing_flow
-        _close_friend_flow_popup(existing_flow)
-
-    existing = _find_friend_add_window()
-    if existing is not None:
-        _force_foreground(existing)
-        print(
-            f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
-            f"(hwnd=0x{existing:08X})"
-        )
-        return existing
+        return existing_flow
 
     _force_foreground(hwnd)
     if not wait_for_foreground(hwnd):
@@ -475,35 +489,9 @@ def step3_open_friend_add_popover(hwnd: int) -> int:
 
 def prepare_friend_add_window() -> int:
     """친구 추가를 시작할 수 있도록 친구 추가 팝오버까지 연다."""
-    existing_flow = _find_friend_flow_popup()
+    existing_flow = _reuse_or_close_existing_flow_popup("Step 1/2 생략")
     if existing_flow is not None:
-        if _find_contact_fields(existing_flow) is not None:
-            _force_foreground(existing_flow)
-            print(
-                f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
-                f"(hwnd=0x{existing_flow:08X}, Step 1/2 생략)"
-            )
-            return existing_flow
-        if _visible_edit_count(existing_flow) == 1:
-            _force_foreground(existing_flow)
-            _click_relative(existing_flow, 92, 142)
-            if _find_contact_fields(existing_flow) is not None:
-                print(
-                    f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
-                    f"(ID 탭 → 연락처 탭, hwnd=0x{existing_flow:08X}, "
-                    "Step 1/2 생략)"
-                )
-                return existing_flow
-        _close_friend_flow_popup(existing_flow)
-
-    existing = _find_friend_add_window()
-    if existing is not None:
-        _force_foreground(existing)
-        print(
-            f"[Step 3] 친구 추가 창이 이미 열려 있습니다. "
-            f"(hwnd=0x{existing:08X}, Step 1/2 생략)"
-        )
-        return existing
+        return existing_flow
 
     hwnd = step1_focus_kakao_main()
     step2_focus_friends_tab(hwnd)
@@ -565,12 +553,7 @@ def step5_confirm_friend_add(popover_hwnd: int) -> bool:
         return True
 
     if not _has_profile_result(current):
-        _close_friend_flow_popup(current)
-        print(
-            "[Step 5] 친구 추가 실패: 오류 상태로 판단해 팝오버를 닫았습니다.",
-            file=sys.stderr,
-        )
-        return False
+        return _close_and_report_error(current)
 
     # valid 번호에서 프로필 결과가 보인 뒤에는 Tab → Enter 로 하단의
     # '친구 추가' 확정 버튼을 누른다. invalid 오류 화면은 위에서 바로 닫는다.
@@ -597,12 +580,9 @@ def step5_confirm_friend_add(popover_hwnd: int) -> bool:
 
     current = _find_friend_flow_popup()
     if current is not None:
-        _close_friend_flow_popup(current)
-    print(
-        "[Step 5] 친구 추가 실패: 오류 상태로 판단해 팝오버를 닫았습니다.",
-        file=sys.stderr,
-    )
-    return False
+        return _close_and_report_error(current)
+    print("[Step 5] 친구 추가 완료: 팝오버가 닫혔습니다.")
+    return True
 
 
 def add_friend_by_contact(name: str, phone: str) -> bool:
