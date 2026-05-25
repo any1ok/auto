@@ -20,6 +20,7 @@ import ctypes.wintypes as wt
 import platform
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 
@@ -145,6 +146,15 @@ GMEM_MOVEABLE = 0x0002
 # 가상 키.
 VK_V = ord('V')
 VK_A = ord('A')
+VK_T = ord('T')
+
+# 표준 파일 열기 다이얼로그 / 버튼 메시지.
+BM_CLICK = 0x00F5
+FILE_DIALOG_TITLES = ("열기", "Open")
+FILE_DIALOG_TIMEOUT_S = 6.0
+FILE_SEND_PREVIEW_TIMEOUT_S = 8.0
+FILE_SEND_CLOSE_TIMEOUT_S = 10.0
+FILE_SEND_POLL_INTERVAL_S = 0.05
 
 # Step 4/5/6 통합용 — 검색 결과를 하나씩 열어 채팅창 타이틀로 매칭 검증.
 # 모디파이어 없는 단일키(VK_RETURN/VK_DOWN/VK_ESCAPE) 는 PostMessage 로 비활성
@@ -1863,6 +1873,230 @@ def step7_send_message(chat_hwnd: int, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 8 — 열린 채팅방에 이미지/파일 전송
+# ---------------------------------------------------------------------------
+
+def _get_window_text(hwnd: int) -> str:
+    """top-level / child 윈도우의 title 텍스트를 읽는다."""
+    user32, _ = _load_win32()
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def _is_visible_window(hwnd: int) -> bool:
+    user32, _ = _load_win32()
+    return bool(user32.IsWindowVisible(hwnd))
+
+
+def _resolve_existing_file_path(raw_path: str) -> Path:
+    """CLI 에서 받은 파일 경로를 실제 Windows 파일로 해석한다.
+
+    사용자가 mac/WSL 스타일 절대 경로(`/Users/.../a.png`)를 준 경우에도,
+    같은 basename 이 현재 작업 폴더나 스크립트 폴더에 있으면 그 파일을 쓴다.
+    """
+    if not raw_path:
+        raise KakaoWinError("전송할 파일 경로가 비어 있습니다.")
+
+    raw = Path(raw_path).expanduser()
+    script_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend((Path.cwd() / raw, script_dir / raw))
+    # `/Users/.../name.ext` 처럼 이 Windows 세션에 없는 절대 경로를 받은 경우.
+    candidates.extend((Path.cwd() / raw.name, script_dir / raw.name))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                return candidate.resolve()
+        except OSError:
+            continue
+
+    searched = ", ".join(str(p) for p in candidates)
+    raise KakaoWinError(
+        f"전송할 파일을 찾지 못했습니다: {raw_path!r}. 확인한 후보: {searched}"
+    )
+
+
+def _wait_for_file_dialog(
+    timeout_s: float = FILE_DIALOG_TIMEOUT_S,
+    interval_s: float = FILE_SEND_POLL_INTERVAL_S,
+) -> int:
+    """Ctrl+T 뒤 카카오톡 소유의 표준 파일 열기 창을 기다린다."""
+    user32, _ = _load_win32()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        fg = user32.GetForegroundWindow()
+        if (
+            fg
+            and _get_window_text(fg) in FILE_DIALOG_TITLES
+            and _get_class_name(fg) == "#32770"
+        ):
+            return fg
+        for h, title, visible, _iconic in _enum_kakao_windows():
+            if visible and title in FILE_DIALOG_TITLES and _get_class_name(h) == "#32770":
+                return h
+        time.sleep(interval_s)
+    raise KakaoWinError(
+        f"Ctrl+T 후 {timeout_s}s 안에 파일 열기 다이얼로그를 찾지 못했습니다."
+    )
+
+
+def _find_file_dialog_filename_edit(dialog_hwnd: int) -> int:
+    """표준 열기 창의 '파일 이름' Edit 컨트롤을 찾는다."""
+    edits = [
+        h for h in _enum_all_descendants(dialog_hwnd)
+        if _get_class_name(h) == "Edit" and _is_visible_window(h)
+    ]
+    if not edits:
+        raise KakaoWinError(
+            f"파일 열기 창(hwnd=0x{dialog_hwnd:08X})에서 파일명 Edit 컨트롤을 "
+            "찾지 못했습니다."
+        )
+    # Windows common dialog 에서는 보통 visible Edit 이 1개다. 혹시 여럿이면
+    # 마지막 visible Edit 이 파일 이름 ComboBox 안쪽 Edit 인 경우가 많다.
+    return edits[-1]
+
+
+def _find_file_dialog_open_button(dialog_hwnd: int) -> Optional[int]:
+    for h in _enum_all_descendants(dialog_hwnd):
+        if _get_class_name(h) != "Button" or not _is_visible_window(h):
+            continue
+        text = _get_window_text(h)
+        if text.startswith("열기") or text.lower().startswith(("open", "&open")):
+            return h
+    return None
+
+
+def _wait_for_file_send_preview(
+    baseline: set[int],
+    dialog_hwnd: int,
+    timeout_s: float = FILE_SEND_PREVIEW_TIMEOUT_S,
+    interval_s: float = FILE_SEND_POLL_INTERVAL_S,
+) -> Optional[int]:
+    """파일 선택 뒤 뜨는 카카오톡 '파일 전송' 확인창을 찾는다.
+
+    현재 빌드에서는 title 이 빈 EVA_Window_Dblclk 으로 뜬다. 기존 광고/보조
+    창도 title 이 비어 있을 수 있어, 파일 선택 직전 baseline 에 없던 새
+    top-level 만 후보로 본다.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for h, _title, visible, _iconic in _enum_kakao_windows():
+            if not visible or h in baseline or h == dialog_hwnd:
+                continue
+            return h
+        time.sleep(interval_s)
+    return None
+
+
+def _kakao_top_level_visible(hwnd: int) -> bool:
+    for h, _title, visible, _iconic in _enum_kakao_windows():
+        if h == hwnd:
+            return visible
+    return False
+
+
+def step8_send_file(chat_hwnd: int, file_path: str) -> None:
+    """열린 채팅방에 이미지/파일 1개를 전송한다.
+
+    검증된 흐름:
+      1) 채팅창 + 입력 RichEdit 포커스
+      2) Ctrl+T 로 카카오톡 파일 전송 다이얼로그 열기
+      3) 표준 '열기' 창의 파일 이름 Edit 에 전체 경로를 paste
+      4) Enter 로 선택
+      5) 카카오톡 '파일 전송' 확인창에서 Enter 로 실제 전송
+    """
+    path = _resolve_existing_file_path(str(file_path))
+
+    _force_foreground(chat_hwnd)
+    if not wait_for_foreground(chat_hwnd):
+        raise KakaoWinError(
+            f"파일 전송 전 채팅창(hwnd=0x{chat_hwnd:08X}) 이 foreground 가 "
+            "되지 않았습니다."
+        )
+    found = _find_message_edit(chat_hwnd)
+    if found is not None:
+        _force_focus(found[0])
+
+    _send_ctrl_chord(VK_T, "T")
+    dialog = _wait_for_file_dialog()
+    _force_foreground(dialog)
+    wait_for_foreground(dialog)
+
+    edit = _find_file_dialog_filename_edit(dialog)
+    open_button = _find_file_dialog_open_button(dialog)
+    _force_focus(edit)
+    saved_clip = _clipboard_get_unicode()
+    try:
+        # WM_SETTEXT 만으로는 common dialog 내부 ComboBox / 파일 리스트 선택
+        # 이벤트가 갱신되지 않는 빌드가 있어, 실제 사용자 입력처럼 paste 한다.
+        _clipboard_set_unicode(str(path))
+        _send_ctrl_a()
+        time.sleep(0.05)
+        _send_ctrl_v()
+        time.sleep(0.2)
+    finally:
+        if saved_clip is not None:
+            try:
+                _clipboard_set_unicode(saved_clip)
+            except KakaoWinError as e:
+                print(
+                    f"[Step 8] 경고: 클립보드 복원 실패: {e}",
+                    file=sys.stderr,
+                )
+
+    baseline = {h for h, _title, _visible, _iconic in _enum_kakao_windows()}
+    _send_vk_sendinput(VK_RETURN)
+    time.sleep(0.4)
+    if _kakao_top_level_visible(dialog) and open_button is not None:
+        # 일부 환경에서 Enter 가 파일명 Edit 안에서만 처리되면 열기 버튼을 직접 누른다.
+        user32, _ = _load_win32()
+        user32.SendMessageW(open_button, BM_CLICK, 0, 0)
+
+    preview = _wait_for_file_send_preview(baseline, dialog)
+    if _kakao_top_level_visible(dialog):
+        raise KakaoWinError(
+            f"파일 선택 후에도 열기 다이얼로그가 닫히지 않았습니다: {path}"
+        )
+
+    if preview is not None:
+        _force_foreground(preview)
+        wait_for_foreground(preview)
+        _send_vk_sendinput(VK_RETURN)
+        if not _wait_window_closed(preview, timeout_s=FILE_SEND_CLOSE_TIMEOUT_S):
+            raise KakaoWinError(
+                f"파일 전송 확인창(hwnd=0x{preview:08X}) 이 "
+                f"{FILE_SEND_CLOSE_TIMEOUT_S}s 안에 닫히지 않았습니다: {path}"
+            )
+    else:
+        print(
+            f"[Step 8] 파일 선택 후 별도 확인창이 감지되지 않았습니다: {path.name}",
+            file=sys.stderr,
+        )
+
+    print(f"[Step 8] 파일 전송 완료: {path} ({path.stat().st_size} bytes)")
+
+
+def step8_send_files(chat_hwnd: int, file_paths: list[str]) -> None:
+    """열린 채팅방에 파일 여러 개를 순서대로 전송한다."""
+    for idx, raw_path in enumerate(file_paths, 1):
+        print(f"[Step 8] 파일 {idx}/{len(file_paths)} 전송 시작: {raw_path}")
+        step8_send_file(chat_hwnd, raw_path)
+
+
+# ---------------------------------------------------------------------------
 # 진입점
 # ---------------------------------------------------------------------------
 
@@ -1893,17 +2127,92 @@ def _prompt_message() -> str:
         return raw  # 빈 문자열이면 step 7 생략 (main 에서 처리)
 
 
+def _prompt_send_kind() -> str:
+    while True:
+        raw = input("무엇을 보낼까요? [1] 메시지  [2] 파일/이미지 : ").strip()
+        if raw in ("1", "2"):
+            return raw
+        print("1 또는 2 중 하나만 입력해주세요.")
+
+
+def _split_file_input(raw: str) -> list[str]:
+    """파일 prompt 입력을 경로 목록으로 바꾼다.
+
+    기본은 입력 전체를 파일 1개로 본다. 여러 파일을 한 번에 보내고 싶을 때만
+    세미콜론(;) 또는 콤마(,)로 구분한다.
+    """
+    text = raw.strip()
+    if not text:
+        return []
+    separator = ";" if ";" in text else "," if "," in text else None
+    if separator is None:
+        parts = [text]
+    else:
+        parts = [part.strip() for part in text.split(separator)]
+    return [part.strip('"') for part in parts if part.strip('"')]
+
+
+def _prompt_file_paths() -> list[str]:
+    while True:
+        raw = input(
+            "보낼 파일/이미지 경로를 입력하세요 (예: a.png, 비우면 생략): "
+        ).rstrip("\r\n")
+        paths = _split_file_input(raw)
+        if paths or not raw.strip():
+            return paths
+        print("파일 경로를 입력해주세요.")
+
+
 def _print_usage() -> None:
     print(
-        f"사용법: python {sys.argv[0]} [1|2|3] [\"검색어\"] [\"메시지\"]\n"
+        f"사용법: python {sys.argv[0]} [1|2|3] [\"검색어\"] [\"메시지\"] "
+        "[--file 파일경로 ...]\n"
         "  1 = 친구, 2 = 채팅, 3 = 더보기\n"
         "  예) python kakao_win.py 2\n"
         "      python kakao_win.py 2 \"홍길동\"\n"
         "      python kakao_win.py 2 \"홍길동\" \"안녕하세요\"\n"
+        "      python kakao_win.py 2 \"홍길동\" --file a.png --file Lunching.pdf\n"
         "  메시지를 빼면 Step 4/5/6 까지 (채팅방만 열고 끝).\n"
+        "  인자 없이 실행하면 [1] 메시지 / [2] 파일·이미지를 선택합니다.\n"
+        "  --file 이 있으면 메시지 prompt 없이 파일만 전송할 수 있습니다.\n"
         "  메시지를 빈 문자열로 주면(\"\") Step 7 생략.",
         file=sys.stderr,
     )
+
+
+def _parse_cli_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    """기존 positional CLI 를 유지하면서 --file 옵션만 추가 파싱."""
+    positional: list[str] = []
+    file_paths: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--file":
+            i += 1
+            if i >= len(argv) or not argv[i]:
+                raise ValueError("--file 뒤에는 파일 경로가 필요합니다.")
+            file_paths.append(argv[i])
+        elif arg.startswith("--file="):
+            value = arg.split("=", 1)[1]
+            if not value:
+                raise ValueError("--file= 뒤에는 파일 경로가 필요합니다.")
+            file_paths.append(value)
+        elif arg == "--files":
+            i += 1
+            start = i
+            while i < len(argv) and not argv[i].startswith("--"):
+                if argv[i]:
+                    file_paths.append(argv[i])
+                i += 1
+            if i == start:
+                raise ValueError("--files 뒤에는 하나 이상의 파일 경로가 필요합니다.")
+            continue
+        elif arg.startswith("--"):
+            raise ValueError(f"알 수 없는 옵션: {arg}")
+        else:
+            positional.append(arg)
+        i += 1
+    return positional, file_paths
 
 
 def main() -> int:
@@ -1913,7 +2222,13 @@ def main() -> int:
         print(f"[오류] {e}", file=sys.stderr)
         return 1
 
-    args = sys.argv[1:]
+    try:
+        args, file_paths = _parse_cli_args(sys.argv[1:])
+    except ValueError as e:
+        print(f"[오류] {e}", file=sys.stderr)
+        _print_usage()
+        return 2
+
     tab: Optional[str] = None
     query: Optional[str] = None
     # message 는 3 종류 상태:
@@ -1948,8 +2263,16 @@ def main() -> int:
     if query is None:
         query = _prompt_query()
     if message is None and not message_arg_given:
-        # 인자도 없고 prompt 도 안 했으면 한 번 물어본다 (빈 입력 = 생략).
-        message = _prompt_message()
+        if file_paths:
+            # 파일만 보내는 호출에서는 터미널 prompt 로 포커스를 빼앗지 않는다.
+            message = ""
+        else:
+            send_kind = _prompt_send_kind()
+            if send_kind == "1":
+                message = _prompt_message()
+            else:
+                message = ""
+                file_paths = _prompt_file_paths()
 
     try:
         hwnd = step1_activate_kakao()
@@ -1960,6 +2283,8 @@ def main() -> int:
             step7_send_message(chat_hwnd, message)
         else:
             print("[Step 7] (생략) 빈 메시지라 전송하지 않습니다.")
+        if file_paths:
+            step8_send_files(chat_hwnd, file_paths)
     except KakaoWinError as e:
         print(f"[오류] {e}", file=sys.stderr)
         return 1
