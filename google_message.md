@@ -108,8 +108,7 @@ python google_message.py "+821012345678" "테스트 메시지입니다." --attac
 python google_message.py "+821012345678" "테스트 메시지입니다." \
   --port 9222 \
   --login-timeout 180 \
-  --action-timeout-ms 15000 \
-  --debug-dir ./google_message_debug
+  --action-timeout-ms 15000
 ```
 
 - `--port` - Chrome CDP 포트
@@ -121,13 +120,6 @@ python google_message.py "+821012345678" "테스트 메시지입니다." \
 - `--profile-directory` - Chrome profile-directory 지정
 - `--login-timeout` - 로그인/페어링 및 Start chat 버튼 대기 시간
 - `--fill-only` - Step 2까지만 수행하고 `~번으로 보내기` 클릭은 생략
-- `--debug-dir` - 실패 시 screenshot/html 저장 위치
-
-## 실패 시 확인
-
-실패하면 `google_message_debug/` 아래에 현재 화면 screenshot 과 HTML 을 저장합니다.
-Google Messages 의 버튼명이나 DOM 구조가 바뀐 경우 이 파일로 어느 단계에서 막혔는지
-확인할 수 있습니다.
 
 ## pip SSL 오류
 

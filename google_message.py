@@ -1,4 +1,4 @@
-"""Google Messages Web automation without third-party packages.
+﻿"""Google Messages Web automation without third-party packages.
 
 Step 1: Open https://messages.google.com/web/conversations in real Chrome.
 Step 2: Click Start chat, enter a phone number, and verify the contact name.
@@ -32,7 +32,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,6 +42,9 @@ DEFAULT_PROFILE_DIR = Path(__file__).resolve().parent / ".google_messages_chrome
 DEFAULT_LOGIN_TIMEOUT_S = 180
 DEFAULT_ACTION_TIMEOUT_MS = 15_000
 CONTACT_VERIFY_TIMEOUT_S = 1.5
+FILE_UPLOAD_TIMEOUT_S = 30.0
+FILE_SEND_TIMEOUT_S = 30.0
+DEFAULT_MMS_MAX_BYTES = 1_000_000
 
 START_CHAT_PATTERN = (
     r"(Start\s*chat|New\s*(chat|conversation)|채팅\s*시작|새\s*(채팅|대화)|대화\s*시작)"
@@ -597,6 +599,7 @@ class CDPClient:
     def __init__(self, ws_url: str) -> None:
         self.ws = WebSocketConnection(ws_url)
         self.next_id = 0
+        self.events: list[dict[str, Any]] = []
 
     def close(self) -> None:
         self.ws.close()
@@ -629,6 +632,8 @@ class CDPClient:
                 continue
 
             if message.get("id") != message_id:
+                if "method" in message:
+                    self.events.append(message)
                 continue
 
             if "error" in message:
@@ -637,6 +642,34 @@ class CDPClient:
                     f"CDP 호출 실패: {method}: {error.get('message') or error}"
                 )
             return message.get("result", {})
+
+    def wait_event(
+        self,
+        method: str,
+        *,
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            for i, event in enumerate(self.events):
+                if event.get("method") == method:
+                    return self.events.pop(i)
+
+            if time.monotonic() >= deadline:
+                raise CDPError(f"CDP 이벤트 타임아웃: {method}")
+
+            try:
+                raw = self.ws.recv_text(timeout_s=max(0.1, deadline - time.monotonic()))
+            except TimeoutError as exc:
+                raise CDPError(f"CDP 이벤트 타임아웃: {method}") from exc
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if "method" in message:
+                if message.get("method") == method:
+                    return message
+                self.events.append(message)
 
     def evaluate(
         self,
@@ -738,55 +771,13 @@ def _body_text(cdp: CDPClient) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _debug_paths(debug_dir: Path, step: str) -> tuple[Path, Path]:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_step = re.sub(r"[^A-Za-z0-9_.-]+", "_", step).strip("_") or "debug"
-    return (
-        debug_dir / f"{stamp}_{safe_step}.png",
-        debug_dir / f"{stamp}_{safe_step}.html",
-    )
-
-
-def save_debug_artifacts(cdp: CDPClient, debug_dir: Path, step: str) -> list[Path]:
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    screenshot_path, html_path = _debug_paths(debug_dir, step)
-    saved: list[Path] = []
-
-    try:
-        result = cdp.call(
-            "Page.captureScreenshot",
-            {"format": "png", "captureBeyondViewport": True},
-            timeout_s=10.0,
-        )
-        data = result.get("data")
-        if data:
-            screenshot_path.write_bytes(base64.b64decode(data))
-            saved.append(screenshot_path)
-    except Exception:
-        pass
-
-    try:
-        html = cdp.evaluate("document.documentElement.outerHTML", timeout_s=5.0)
-        if isinstance(html, str):
-            html_path.write_text(html, encoding="utf-8")
-            saved.append(html_path)
-    except Exception:
-        pass
-
-    return saved
-
-
-def fail_with_debug(
+def fail_step(
     cdp: CDPClient,
     args: argparse.Namespace,
     step: str,
     message: str,
 ) -> None:
-    paths = save_debug_artifacts(cdp, Path(args.debug_dir), step)
-    suffix = ""
-    if paths:
-        suffix = "\n디버그 파일:\n" + "\n".join(f"  - {path}" for path in paths)
-    raise GoogleMessageError(message + suffix)
+    raise GoogleMessageError(message)
 
 
 def _click_point(cdp: CDPClient, x: float, y: float) -> None:
@@ -853,6 +844,92 @@ def _press_enter(cdp: CDPClient) -> None:
 
 def _insert_text(cdp: CDPClient, text: str) -> None:
     cdp.call("Input.insertText", {"text": text}, timeout_s=5.0)
+
+
+def _resolve_existing_file_path(raw_path: str) -> Path:
+    """Resolve CLI/prompt file paths, including `/Users/.../name` fallbacks."""
+    if not raw_path:
+        raise GoogleMessageError("전송할 파일 경로가 비어 있습니다.")
+
+    raw = Path(raw_path).expanduser()
+    script_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend((Path.cwd() / raw, script_dir / raw))
+    candidates.extend((Path.cwd() / raw.name, script_dir / raw.name))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                return candidate.resolve()
+        except OSError:
+            continue
+
+    searched = ", ".join(str(p) for p in candidates)
+    raise GoogleMessageError(
+        f"전송할 파일을 찾지 못했습니다: {raw_path!r}. 확인한 후보: {searched}"
+    )
+
+
+def _format_file_size(size: int) -> str:
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.2f} MB"
+    if size >= 1_000:
+        return f"{size / 1_000:.1f} KB"
+    return f"{size} bytes"
+
+
+def _validate_mms_file_sizes(raw_file_paths: list[str], max_bytes: int) -> list[Path]:
+    if max_bytes <= 0:
+        return [_resolve_existing_file_path(path) for path in raw_file_paths]
+
+    files = [_resolve_existing_file_path(path) for path in raw_file_paths]
+    too_large = [path for path in files if path.stat().st_size > max_bytes]
+    if too_large:
+        limit = _format_file_size(max_bytes)
+        details = "\n".join(
+            f"  - {path.name}: {_format_file_size(path.stat().st_size)} > {limit}"
+            for path in too_large
+        )
+        raise GoogleMessageError(
+            "MMS 첨부 최대 용량을 넘어서 전송을 시작하지 않습니다.\n"
+            f"기본 한도: {limit}\n"
+            f"{details}"
+        )
+    return files
+
+
+def _split_file_input(raw: str) -> list[str]:
+    text = raw.strip()
+    if not text:
+        return []
+    separator = ";" if ";" in text else "," if "," in text else None
+    parts = [text] if separator is None else [part.strip() for part in text.split(separator)]
+    return [part.strip('"') for part in parts if part.strip('"')]
+
+
+def _prompt_send_kind() -> str:
+    while True:
+        raw = input("무엇을 보낼까요? [1] 메시지  [2] 파일/이미지 : ").strip()
+        if raw in ("1", "2"):
+            return raw
+        print("1 또는 2 중 하나만 입력해주세요.")
+
+
+def _prompt_file_paths() -> list[str]:
+    while True:
+        raw = input("보낼 파일/이미지 경로를 입력하세요 (예: a.png, 비우면 생략): ").rstrip("\r\n")
+        paths = _split_file_input(raw)
+        if paths or not raw.strip():
+            return paths
+        print("파일 경로를 입력해주세요.")
 
 
 def _find_start_chat(cdp: CDPClient) -> dict[str, Any]:
@@ -977,7 +1054,7 @@ def wait_for_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
             time.sleep(0.5)
             continue
         if UNSAFE_BROWSER_RE.search(body):
-            fail_with_debug(
+            fail_step(
                 cdp,
                 args,
                 "unsafe_browser",
@@ -1002,7 +1079,7 @@ def wait_for_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
             reported_wait = True
         time.sleep(1)
 
-    fail_with_debug(
+    fail_step(
         cdp,
         args,
         "start_chat_not_found",
@@ -1058,7 +1135,7 @@ def use_existing_messages_page(cdp: CDPClient, args: argparse.Namespace) -> None
 
     body = _body_text(cdp)
     if UNSAFE_BROWSER_RE.search(body):
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "unsafe_browser",
@@ -1078,7 +1155,7 @@ def use_existing_messages_page(cdp: CDPClient, args: argparse.Namespace) -> None
 def click_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
     info = _find_start_chat(cdp)
     if not info.get("found"):
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "click_start_chat_failed",
@@ -1104,7 +1181,7 @@ def click_start_chat(cdp: CDPClient, args: argparse.Namespace) -> None:
             return
         time.sleep(0.2)
 
-    fail_with_debug(
+    fail_step(
         cdp,
         args,
         "click_start_chat_no_route",
@@ -1198,6 +1275,56 @@ def _recipient_field_contains(cdp: CDPClient, phone: str) -> bool:
     )
 
 
+def _set_recipient_input_value(cdp: CDPClient, phone: str) -> dict[str, Any]:
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          const phone = {json.dumps(phone)};
+          {_visible_helper_js()}
+          const candidates = [
+            document.querySelector('[data-e2e-contact-input]'),
+            ...document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')
+          ].filter(Boolean);
+          for (const el of candidates) {{
+            if (!visible(el)) continue;
+            const label = [
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('placeholder') || '',
+              el.getAttribute('title') || '',
+              el.getAttribute('name') || ''
+            ].join(' ');
+            if (!el.hasAttribute('data-e2e-contact-input') && !/받는|수신|recipient|phone|전화|email|이메일|이름/i.test(label)) {{
+              continue;
+            }}
+            el.focus();
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
+              const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              if (setter) setter.call(el, phone);
+              else el.value = phone;
+            }} else {{
+              el.textContent = phone;
+            }}
+            el.dispatchEvent(new InputEvent('input', {{
+              bubbles: true,
+              inputType: 'insertText',
+              data: phone
+            }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: phone.slice(-1) || '0' }}));
+            return {{
+              found: true,
+              value: el.value || el.innerText || el.textContent || '',
+              ...center(el)
+            }};
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
 def enter_phone_number(cdp: CDPClient, args: argparse.Namespace, phone: str) -> None:
     deadline = time.monotonic() + (args.action_timeout_ms / 1000)
     info: dict[str, Any] = {"found": False}
@@ -1208,10 +1335,12 @@ def enter_phone_number(cdp: CDPClient, args: argparse.Namespace, phone: str) -> 
         time.sleep(0.25)
 
     if not info.get("found"):
-        fail_with_debug(cdp, args, "recipient_input_not_found", "전화번호 입력창을 찾지 못했습니다.")
+        fail_step(cdp, args, "recipient_input_not_found", "전화번호 입력창을 찾지 못했습니다.")
 
     _click_point(cdp, float(info["x"]), float(info["y"]))
-    _insert_text(cdp, phone)
+    set_info = _set_recipient_input_value(cdp, phone)
+    if not set_info.get("found"):
+        _insert_text(cdp, phone)
 
     verify_deadline = time.monotonic() + 5
     while time.monotonic() < verify_deadline:
@@ -1220,7 +1349,7 @@ def enter_phone_number(cdp: CDPClient, args: argparse.Namespace, phone: str) -> 
             return
         time.sleep(0.2)
 
-    fail_with_debug(
+    fail_step(
         cdp,
         args,
         "recipient_input_verify_failed",
@@ -1628,7 +1757,7 @@ def confirm_recipient(cdp: CDPClient, args: argparse.Namespace, phone: str) -> N
             return
         time.sleep(0.35)
 
-    fail_with_debug(
+    fail_step(
         cdp,
         args,
         "recipient_confirm_failed",
@@ -1646,7 +1775,7 @@ def step3_click_send_to_number(cdp: CDPClient, args: argparse.Namespace, phone: 
         time.sleep(0.25)
 
     if not info.get("found"):
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "send_to_number_button_not_found",
@@ -1669,7 +1798,7 @@ def step3_click_send_to_number(cdp: CDPClient, args: argparse.Namespace, phone: 
                 return
             time.sleep(0.25)
 
-    fail_with_debug(
+    fail_step(
         cdp,
         args,
         "send_to_number_click_failed",
@@ -1687,7 +1816,7 @@ def step4_type_and_send_message(cdp: CDPClient, args: argparse.Namespace, messag
         time.sleep(0.25)
 
     if not composer.get("found"):
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "message_composer_not_found",
@@ -1704,7 +1833,7 @@ def step4_type_and_send_message(cdp: CDPClient, args: argparse.Namespace, messag
             break
         time.sleep(0.2)
     else:
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "message_input_verify_failed",
@@ -1720,14 +1849,14 @@ def step4_type_and_send_message(cdp: CDPClient, args: argparse.Namespace, messag
         time.sleep(0.25)
 
     if not send_button.get("found"):
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "send_message_button_not_found",
             "메시지 전송 버튼을 찾지 못했습니다.",
         )
     if send_button.get("disabled"):
-        fail_with_debug(
+        fail_step(
             cdp,
             args,
             "send_message_button_disabled",
@@ -1743,12 +1872,432 @@ def step4_type_and_send_message(cdp: CDPClient, args: argparse.Namespace, messag
             return
         time.sleep(0.25)
 
-    fail_with_debug(
+    fail_step(
         cdp,
         args,
         "message_send_verify_failed",
         "전송 버튼을 클릭했지만 메시지 입력창이 비워지는 것을 확인하지 못했습니다.",
     )
+
+
+def _find_attachment_overflow_button(cdp: CDPClient) -> dict[str, Any]:
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          {_visible_helper_js()}
+          const candidates = [
+            ...document.querySelectorAll('[data-e2e-picker-button="OVERFLOW"]'),
+            ...document.querySelectorAll('button[aria-label*="첨부"], button[aria-label*="Attach" i]')
+          ];
+          for (const el of candidates) {{
+            if (!visible(el)) continue;
+            return {{
+              found: true,
+              text: [
+                el.innerText || '',
+                el.textContent || '',
+                el.getAttribute('aria-label') || ''
+              ].join(' ').replace(/\\s+/g, ' ').trim(),
+              ...center(el)
+            }};
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
+def _find_device_upload_button(cdp: CDPClient) -> dict[str, Any]:
+    return cdp.evaluate(
+        f"""
+        (() => {{
+          {_visible_helper_js()}
+          const candidates = [
+            ...document.querySelectorAll('[data-e2e-picker-button="ATTACHMENT"]'),
+            ...document.querySelectorAll('[role="menuitem"]')
+          ];
+          for (const el of candidates) {{
+            if (!visible(el)) continue;
+            if (el.getAttribute('data-e2e-picker-button') === 'OVERFLOW') continue;
+            const text = [
+              el.innerText || '',
+              el.textContent || '',
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('title') || ''
+            ].join(' ').replace(/\\s+/g, ' ').trim();
+            if (el.getAttribute('data-e2e-picker-button') === 'ATTACHMENT' || /기기|업로드|upload|device/i.test(text)) {{
+              return {{
+                found: true,
+                text,
+                ...center(el)
+              }};
+            }}
+          }}
+          return {{ found: false }};
+        }})()
+        """,
+        timeout_s=5.0,
+    ) or {"found": False}
+
+
+def _find_file_input_node(cdp: CDPClient) -> Optional[int]:
+    cdp.call("DOM.enable", timeout_s=5.0)
+    document = cdp.call("DOM.getDocument", {"depth": -1, "pierce": True}, timeout_s=10.0)
+    root_id = document.get("root", {}).get("nodeId")
+    if not root_id:
+        return None
+    result = cdp.call(
+        "DOM.querySelector",
+        {"nodeId": root_id, "selector": "input[type=file]"},
+        timeout_s=5.0,
+    )
+    node_id = result.get("nodeId")
+    return int(node_id) if node_id else None
+
+
+def _click_visible_device_upload_button(cdp: CDPClient) -> bool:
+    return bool(
+        cdp.evaluate(
+            """
+            (() => {
+              const visible = (el) => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       rect.width > 0 &&
+                       rect.height > 0;
+              };
+              const buttons = Array.from(
+                document.querySelectorAll('[data-e2e-picker-button="ATTACHMENT"]')
+              ).filter(visible);
+              const button = buttons[buttons.length - 1];
+              if (!button) return false;
+              button.click();
+              return true;
+            })()
+            """,
+            timeout_s=5.0,
+        )
+    )
+
+
+def _open_device_upload_file_chooser(cdp: CDPClient, args: argparse.Namespace) -> Optional[dict[str, Any]]:
+    cdp.call("Page.enable", timeout_s=5.0)
+    cdp.call("DOM.enable", timeout_s=5.0)
+    cdp.call("Page.setInterceptFileChooserDialog", {"enabled": True}, timeout_s=5.0)
+
+    upload_deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+    upload: dict[str, Any] = {"found": False}
+    # 이전 실패/중단으로 메뉴가 이미 열린 상태일 수 있으니 업로드 항목을 먼저 본다.
+    upload = _find_device_upload_button(cdp)
+    if not upload.get("found"):
+        overflow_deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+        overflow: dict[str, Any] = {"found": False}
+        while time.monotonic() < overflow_deadline:
+            overflow = _find_attachment_overflow_button(cdp)
+            if overflow.get("found"):
+                break
+            time.sleep(0.25)
+        if not overflow.get("found"):
+            cdp.call("Page.setInterceptFileChooserDialog", {"enabled": False}, timeout_s=5.0)
+            fail_step(
+                cdp,
+                args,
+                "attachment_button_not_found",
+                "첨부파일 버튼을 찾지 못했습니다.",
+            )
+
+        _click_point(cdp, float(overflow["x"]), float(overflow["y"]))
+
+    while time.monotonic() < upload_deadline:
+        upload = _find_device_upload_button(cdp)
+        if upload.get("found"):
+            break
+        time.sleep(0.25)
+    if not upload.get("found"):
+        cdp.call("Page.setInterceptFileChooserDialog", {"enabled": False}, timeout_s=5.0)
+        fail_step(
+            cdp,
+            args,
+            "device_upload_button_not_found",
+            "첨부 메뉴에서 '기기에서 업로드' 항목을 찾지 못했습니다.",
+        )
+
+    if not _click_visible_device_upload_button(cdp):
+        _click_point(cdp, float(upload["x"]), float(upload["y"]))
+    try:
+        return cdp.wait_event("Page.fileChooserOpened", timeout_s=10.0)
+    except CDPError:
+        # 일부 상태에서는 hidden input 이 이미 만들어져 있고 이벤트가 오지 않을 수 있다.
+        # caller 가 DOM.querySelector fallback 을 시도한다.
+        return None
+
+
+def _body_contains_any_file_name(cdp: CDPClient, file_paths: list[Path]) -> bool:
+    names = [path.name for path in file_paths]
+    return bool(
+        cdp.evaluate(
+            f"""
+            (() => {{
+              const names = {json.dumps(names, ensure_ascii=False)};
+              const text = document.body ? document.body.innerText || '' : '';
+              return names.some((name) => text.includes(name));
+            }})()
+            """,
+            timeout_s=3.0,
+        )
+    )
+
+
+def _composer_attachment_count(cdp: CDPClient) -> int:
+    value = cdp.evaluate(
+        """
+        (() => {
+          const roots = [
+            ...document.querySelectorAll('mws-message-compose'),
+            ...document.querySelectorAll('mw-message-compose')
+          ];
+          const scope = roots[roots.length - 1] || document.body;
+          return scope ? scope.querySelectorAll('[data-e2e-attachment-item]').length : 0;
+        })()
+        """,
+        timeout_s=3.0,
+    )
+    return int(value or 0)
+
+
+def _message_failure_count(cdp: CDPClient) -> int:
+    value = cdp.evaluate(
+        r"""
+        (() => {
+          const failureText = /(\uc804\uc1a1\ub418\uc9c0 \uc54a|\ub2e4\uc2dc \uc2dc\ub3c4|failed to send|not sent|couldn't send)/i;
+          const visible = (el) => {
+            const style = getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   rect.width > 0 &&
+                   rect.height > 0;
+          };
+          const nodes = Array.from(document.querySelectorAll('mw-message-failure-status'))
+            .filter(visible);
+          if (nodes.length) return nodes.length;
+          return Array.from(document.querySelectorAll('[role="alert"], [aria-live], .failure, .error'))
+            .filter(visible)
+            .filter((el) => failureText.test(el.innerText || el.textContent || el.getAttribute('aria-label') || ''))
+            .length;
+        })()
+        """,
+        timeout_s=3.0,
+    )
+    return int(value or 0)
+
+
+def _latest_outgoing_message_state(cdp: CDPClient) -> dict[str, Any]:
+    return cdp.evaluate(
+        r"""
+        (() => {
+          const wrappers = Array.from(document.querySelectorAll('mws-message-wrapper'))
+            .filter((wrapper) => wrapper.querySelector('[data-e2e-message-outgoing="true"]'));
+          const wrapper = wrappers[wrappers.length - 1];
+          if (!wrapper) return { found: false };
+          const core = wrapper.querySelector('[data-e2e-message-wrapper-core]');
+          const labels = Array.from(wrapper.querySelectorAll('[aria-label]'))
+            .map((el) => el.getAttribute('aria-label') || '')
+            .join(' ');
+          const text = wrapper.innerText || wrapper.textContent || '';
+          const combined = `${labels} ${text}`.replace(/\s+/g, ' ').trim();
+          return {
+            found: true,
+            id: wrapper.getAttribute('msg-id') ||
+                core?.getAttribute('data-e2e-message-id') ||
+                '',
+            hasFailure: !!wrapper.querySelector('mw-message-failure-status'),
+            hasImage: !!wrapper.querySelector('mws-image-message-part, [data-e2e-message-image]'),
+            hasFile: !!wrapper.querySelector('mws-file-message-part, [data-e2e-file]'),
+            sent: /(전송되었습니다|sent)/i.test(combined),
+            text: combined.slice(0, 500)
+          };
+        })()
+        """,
+        timeout_s=3.0,
+    ) or {"found": False}
+
+
+def _wait_for_file_send_result(
+    cdp: CDPClient,
+    args: argparse.Namespace,
+    path: Path,
+    *,
+    before_attachment_count: int,
+    before_latest_message_id: str,
+) -> None:
+    sent_deadline = time.monotonic() + FILE_SEND_TIMEOUT_S
+    while time.monotonic() < sent_deadline:
+        latest = _latest_outgoing_message_state(cdp)
+        is_new_latest = bool(latest.get("id")) and latest.get("id") != before_latest_message_id
+        if is_new_latest and latest.get("hasFailure"):
+            fail_step(
+                cdp,
+                args,
+                "file_send_failed",
+                f"Google Messages displayed a send failure after sending: {path.name}",
+            )
+        if is_new_latest and latest.get("sent"):
+            print(f"[Step 5] 파일 전송 완료: {path.name}")
+            return
+        if _composer_attachment_count(cdp) <= before_attachment_count:
+            quick_deadline = min(sent_deadline, time.monotonic() + 3.0)
+            while time.monotonic() < quick_deadline:
+                latest = _latest_outgoing_message_state(cdp)
+                is_new_latest = (
+                    bool(latest.get("id")) and latest.get("id") != before_latest_message_id
+                )
+                if is_new_latest and latest.get("hasFailure"):
+                    fail_step(
+                        cdp,
+                        args,
+                        "file_send_failed",
+                        f"Google Messages displayed a send failure after sending: {path.name}",
+                    )
+                if is_new_latest and latest.get("sent"):
+                    print(f"[Step 5] 파일 전송 완료: {path.name}")
+                    return
+                time.sleep(0.5)
+        time.sleep(0.5)
+
+    fail_step(
+        cdp,
+        args,
+        "file_send_verify_failed",
+        f"전송 버튼을 눌렀지만 파일 전송 완료 상태를 확인하지 못했습니다: {path.name}",
+    )
+
+
+def _wait_send_button_enabled(cdp: CDPClient, args: argparse.Namespace) -> dict[str, Any]:
+    deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+    button: dict[str, Any] = {"found": False}
+    while time.monotonic() < deadline:
+        button = _find_send_message_button(cdp)
+        if button.get("found") and not button.get("disabled"):
+            return button
+        time.sleep(0.25)
+    return button
+
+
+def _press_visible_send_button(cdp: CDPClient, args: argparse.Namespace) -> None:
+    focused = bool(
+        cdp.evaluate(
+            """
+            (() => {
+              const visible = (el) => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       rect.width > 0 &&
+                       rect.height > 0;
+              };
+              const buttons = Array.from(document.querySelectorAll('[data-e2e-send-text-button]'))
+                .filter(visible)
+                .filter((el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+              const button = buttons[buttons.length - 1];
+              if (!button) return false;
+              button.focus();
+              return document.activeElement === button;
+            })()
+            """,
+            timeout_s=5.0,
+        )
+    )
+    if not focused:
+        send_button = _wait_send_button_enabled(cdp, args)
+        if not send_button.get("found") or send_button.get("disabled"):
+            fail_step(
+                cdp,
+                args,
+                "send_file_button_not_found",
+                "파일 전송 버튼을 찾지 못했습니다.",
+            )
+        _click_point(cdp, float(send_button["x"]), float(send_button["y"]))
+        return
+    _press_enter(cdp)
+
+
+def step5_send_files(cdp: CDPClient, args: argparse.Namespace, raw_file_paths: list[str]) -> None:
+    files = [_resolve_existing_file_path(path) for path in raw_file_paths]
+    if not files:
+        return
+
+    composer_deadline = time.monotonic() + (args.action_timeout_ms / 1000)
+    while time.monotonic() < composer_deadline:
+        if _composer_visible(cdp):
+            break
+        time.sleep(0.25)
+    else:
+        fail_step(cdp, args, "file_composer_not_found", "파일 전송 전 메시지 입력창을 찾지 못했습니다.")
+
+    for index, path in enumerate(files, 1):
+        print(f"[Step 5] 파일 {index}/{len(files)} 업로드 시작: {path}")
+        before_attachment_count = _composer_attachment_count(cdp)
+        file_input_node = _find_file_input_node(cdp)
+        try:
+            event: Optional[dict[str, Any]] = None
+            if file_input_node is None:
+                event = _open_device_upload_file_chooser(cdp, args)
+            set_params: dict[str, Any] = {"files": [str(path)]}
+            if file_input_node is not None:
+                set_params["nodeId"] = file_input_node
+            elif event and event.get("params", {}).get("backendNodeId"):
+                set_params["backendNodeId"] = event["params"]["backendNodeId"]
+            else:
+                file_input_node = _find_file_input_node(cdp)
+                if file_input_node is None:
+                    fail_step(
+                        cdp,
+                        args,
+                        "file_input_not_found",
+                        "파일 선택 input 을 찾지 못했습니다.",
+                    )
+                set_params["nodeId"] = file_input_node
+            cdp.call("DOM.setFileInputFiles", set_params, timeout_s=10.0)
+        finally:
+            try:
+                cdp.call("Page.setInterceptFileChooserDialog", {"enabled": False}, timeout_s=5.0)
+            except CDPError:
+                pass
+
+        upload_deadline = time.monotonic() + FILE_UPLOAD_TIMEOUT_S
+        send_button: dict[str, Any] = {"found": False}
+        while time.monotonic() < upload_deadline:
+            send_button = _find_send_message_button(cdp)
+            attachment_added = _composer_attachment_count(cdp) > before_attachment_count
+            if attachment_added and send_button.get("found") and not send_button.get("disabled"):
+                break
+            if attachment_added or _body_contains_any_file_name(cdp, [path]):
+                send_button = _wait_send_button_enabled(cdp, args)
+                if send_button.get("found") and not send_button.get("disabled"):
+                    break
+            time.sleep(0.5)
+        else:
+            fail_step(
+                cdp,
+                args,
+                "file_upload_verify_failed",
+                f"파일을 선택했지만 전송 가능한 상태가 되지 않았습니다: {path.name}",
+            )
+
+        before_latest_message_id = str(_latest_outgoing_message_state(cdp).get("id") or "")
+        _press_visible_send_button(cdp, args)
+        _wait_for_file_send_result(
+            cdp,
+            args,
+            path,
+            before_attachment_count=before_attachment_count,
+            before_latest_message_id=before_latest_message_id,
+        )
 
 
 def step2_start_chat_and_phone(
@@ -1785,6 +2334,26 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--name", dest="name_option", help="기대하는 연락처 이름.")
     parser.add_argument("--phone", dest="phone_option", help="입력할 전화번호.")
     parser.add_argument("--message", dest="message_option", help="보낼 메시지.")
+    parser.add_argument(
+        "--file",
+        dest="file_paths",
+        action="append",
+        default=[],
+        help="보낼 이미지/파일 경로. 여러 번 지정할 수 있습니다.",
+    )
+    parser.add_argument(
+        "--files",
+        dest="file_paths_many",
+        nargs="+",
+        default=[],
+        help="보낼 이미지/파일 경로 여러 개.",
+    )
+    parser.add_argument(
+        "--mms-max-bytes",
+        type=int,
+        default=DEFAULT_MMS_MAX_BYTES,
+        help="MMS로 보낼 파일 1개당 최대 바이트. 기본값: 1000000.",
+    )
     parser.add_argument("--url", default=MESSAGES_URL, help=f"열 URL. 기본값: {MESSAGES_URL}")
     parser.add_argument("--port", type=int, default=DEFAULT_DEBUG_PORT, help="Chrome CDP 포트.")
     parser.add_argument(
@@ -1823,12 +2392,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="호환용 옵션입니다. 기본 동작이 이미 Step 3 수신자 선택까지 수행합니다.",
     )
-    parser.add_argument(
-        "--debug-dir",
-        default=str(Path.cwd() / "google_message_debug"),
-        help="실패 시 screenshot/html 저장 폴더.",
-    )
-
     args = parser.parse_args(argv)
     values = list(args.values)
     if len(values) > 3:
@@ -1837,6 +2400,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     name = args.name_option
     phone = args.phone_option
     message = args.message_option
+    file_paths = list(args.file_paths or []) + list(args.file_paths_many or [])
 
     if phone is None:
         if values:
@@ -1865,6 +2429,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     args.name = _normalize_name(name) if name else None
     args.phone = phone
     args.message = message
+    args.file_paths = file_paths
 
     if not args.phone:
         args.phone = input("전화번호: ").strip()
@@ -1872,14 +2437,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error("전화번호가 비어 있습니다.")
     if len(_normalize_digits(args.phone)) < 7:
         parser.error("전화번호 숫자가 너무 짧습니다.")
-    if not args.fill_only and args.message is None:
-        args.message = input("메시지: ").strip()
+    if not args.fill_only and args.message is None and not args.file_paths:
+        send_kind = _prompt_send_kind()
+        if send_kind == "1":
+            args.message = input("메시지: ").strip()
+        else:
+            args.file_paths = _prompt_file_paths()
     if args.message is not None and not args.message.strip():
         parser.error("메시지가 비어 있습니다.")
+    if not args.fill_only and args.message is None and not args.file_paths:
+        parser.error("보낼 메시지 또는 파일이 없습니다.")
     return args
 
 
 def run(args: argparse.Namespace) -> int:
+    if not args.fill_only and args.file_paths:
+        _validate_mms_file_sizes(args.file_paths, int(args.mms_max_bytes))
+
     ensure_chrome_cdp(args)
     target = _get_or_create_target(args.port, args.url)
     already_open = _is_messages_target(target)
@@ -1900,9 +2474,15 @@ def run(args: argparse.Namespace) -> int:
         )
         if not args.fill_only:
             step3_click_send_to_number(cdp, args, args.phone.strip())
+            did_send = False
             if args.message is not None:
                 step4_type_and_send_message(cdp, args, args.message)
-                print("[완료] Step 1~4 성공.")
+                did_send = True
+            if args.file_paths:
+                step5_send_files(cdp, args, args.file_paths)
+                did_send = True
+            if did_send:
+                print("[완료] Step 1~5 성공.")
             else:
                 print("[완료] Step 1~3 성공.")
         else:
@@ -1927,3 +2507,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
