@@ -12,7 +12,7 @@ Python 으로 카카오톡 데스크톱 앱을 단계별로 자동화합니다.
 - [x] Step 5 — 일치 확인된 첫 결과(채팅방) 를 Return 으로 열기
 - [x] Step 6 — 카카오톡 windows 의 AXTitle 에 query 가 떴는지로 **열림 검증**
 - [x] Step 7 — 열린 채팅방에 메시지를 `⌘V` 로 붙여넣고 `Return` 으로 전송
-- [x] Step 8 — 열린 채팅방에 이미지/파일을 파일 URL paste 또는 파일 선택창 + `Return` 으로 전송
+- [x] Step 8 — 열린 채팅방에 이미지/파일을 파일 선택창 + `Return` 으로 전송
 
 ## 요구사항
 
@@ -71,5 +71,5 @@ python3 kakao_mac.py 2 "홍길동" --file a.png --file Lunching.pdf
 - Step 5 는 클릭이 아니라 `key code 125` (↓) × first_idx → `key code 36` (Return) 만 사용. 카카오톡 Mac 검색창은 입력 직후 첫 결과를 자동 하이라이트하지 않아서 Return 만 보내면 무시된다. 검색창에서 ↓ 를 누르면 결과 리스트의 다음 row 로 포커스가 이동하므로 Step 4 가 알려준 1-indexed `first_idx` 만큼 ↓ 를 보낸 뒤 Return 한다. (배지 row `"1"`/`"999+"` 도 키보드 navigable 이라 first_idx 가 곧 ↓ 횟수와 같음.) 모든 키 코드는 단일 osascript 안에서 batch 전송 → 중간에 터미널이 키를 가로챌 여지 없음. `keystroke` 가 아닌 `key code` 라 한글 IME 영향 없음.
 - Step 6 은 카카오톡 프로세스의 `windows` 의 `name` (AXTitle) 만 본다. 새 채팅방은 별도 윈도우로 뜨므로 어떤 윈도우의 타이틀이 query 와 같으면 (= `WINDOW_TITLE_EXACT`) 열림으로 확정, 포함하기만 하면 (= `WINDOW_TITLE_CONTAINS`) 약한 확정 (타이틀 장식 가능성). EXACT 가 보이면 즉시 break, 아니면 최대 `OPEN_VERIFY_MAX_ITERS` 회 폴링. 매 회 모든 윈도우 이름을 함께 모아 마지막 시도분을 stderr 에 찍어 디버깅을 쉽게 한다.
 - Step 7 은 Step 3 와 100% 같은 키 입력 패턴 (`pbcopy` + `⌘V` + `Return` 을 단일 osascript batch). 채팅방을 열면 카톡이 메시지 입력칸에 자동 포커스해 두므로 별도 포커스 이동 X. `Return` 은 카톡 기본 설정 'Return = 보내기' 를 전제. 환경설정에서 'Return = 줄바꿈' 으로 바꾼 경우 줄만 바뀌고 전송이 안 된다. Step 6 이 실패하면 Step 7 은 일부러 실행 안 함 (엉뚱한 창에 메시지 가는 사고 방지).
-- Step 8 은 이미지 파일은 `set the clipboard to (POSIX file "...")` 로 macOS pasteboard 에 파일 URL 타입을 올린 뒤 `⌘V` 합니다. PDF 같은 일반 파일은 카카오톡 파일 첨부 버튼을 AXPress 로 열고, 파일 선택창에서 `⌘⇧G` + 경로 paste + `Return` 으로 선택합니다. 두 경로 모두 카카오톡이 띄우는 `파일 전송` sheet 를 확인하고, 실제 전송 확정은 클릭이 아니라 `Return` 으로만 합니다. 여러 `--file` 은 현재 안정성을 위해 1개씩 순서대로 전송합니다.
+- Step 8 은 이미지와 일반 파일을 구분하지 않고 카카오톡 파일 첨부 버튼을 AXPress 로 열고, 파일 선택창에서 `⌘⇧G` + 경로 paste + `Return` 으로 선택합니다. 카카오톡이 띄우는 `파일 전송` sheet 를 확인하고, 실제 전송 확정은 클릭이 아니라 `Return` 으로만 합니다. 여러 `--file` 은 현재 안정성을 위해 1개씩 순서대로 전송합니다.
 - Codex 앱 터미널처럼 `LC_ALL=C` 인 환경에서는 `pbcopy` 가 한글을 비울 수 있어, 스크립트 내부에서 `LC_ALL=en_US.UTF-8` / `LC_CTYPE=en_US.UTF-8` 로 보정합니다.
